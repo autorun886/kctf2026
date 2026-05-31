@@ -15,9 +15,9 @@ static const uint32_t KPT[3][2] = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR，阻止 MOVZ/MOVK 内联到 .text（避免 CRC 振荡） */
 static volatile const uint32_t KCT[3][2] = {
-    {0xf41eb566u, 0x05ad8d82u},
-    {0x16275be9u, 0x4db01f1du},
-    {0xadfb320bu, 0x86502954u}
+    {0xf58de49bu, 0x001743d1u},
+    {0x6be0676fu, 0xc04f8f0cu},
+    {0xd0896eb4u, 0x87ed2921u}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */
@@ -39,13 +39,14 @@ static void xtea_check_encrypt(uint32_t v[2]) {
  */
 void repair_constants(const uint8_t *flag, uint8_t sbox_first) {
     /* 花指令：永真分支，.word 迷惑反汇编器 */
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xDEADC0DE\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
 
     /* 蜜罐 B：独立时间差检测（不共享 key_expand.c 的全局变量） */
     typedef int (*fn_cgt)(clockid_t, struct timespec *);

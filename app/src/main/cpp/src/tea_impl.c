@@ -26,13 +26,14 @@ static const uint32_t honey_h[8] = {
  * AI 会认定为 TEA 加密，实际结果完全不同。
  */
 void __attribute__((used)) honey_tea_path(uint32_t v[2], const uint32_t key[4]) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0x13371337\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     uint32_t sum = 0;
     for (int i = 0; i < 32; i++) {
         sum += HONEY_DELTA;

@@ -13,13 +13,14 @@ extern uint32_t dispatch_table[4];  /* repair_cfg 填入 */
  */
 void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
     /* 花指令：永真分支，.word 迷惑反汇编器 */
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xBAADF00D\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     uint32_t seed = *(const uint32_t *)(flag + 9);
     (void)cfg_dependency;  /* 由调用方传入 dispatch_table[0]&0xFF */
 
@@ -38,7 +39,7 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
         sbox_shipped[(i + offset) & 0xFFu] ^= key_stream[i];
 
     /* 已知对验证：3 字节约束，把有效 seed 从 ~1.6 亿压到 ~1 个 */
-    static volatile const uint8_t SBOX_CHECK[3] = {0x03, 0x62, 0x02};  /* converge.py 填入 */
+    static volatile const uint8_t SBOX_CHECK[3] = {0xa7, 0x99, 0x4d};  /* converge.py 填入 */
     /* volatile 局部变量强制内存加载，阻止编译器将值编码为 .text 立即数（避免 CRC 振荡） */
     volatile uint8_t sc0 = SBOX_CHECK[0];
     volatile uint8_t sc1 = SBOX_CHECK[1];

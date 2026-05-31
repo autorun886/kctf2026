@@ -8,6 +8,11 @@
 /* g_render_mode 定义在此，spn_round.c 通过 extern 引用 */
 volatile uint32_t g_render_mode = 0x00u;
 
+/* 不透明谓词：nativeProcessInput 入口写入 flag[0]，
+ * 花指令用此值做条件判断。IDA 不知道输入值，无法优化。
+ * 选手不能 patch 此值因为 flag[0] 参与方案 A 验证。 */
+volatile uint32_t g_opaque = 0;
+
 static int parse_tracer_pid(const char *buf) {
     const char *p = strstr(buf, get_string(1));  /* "TracerPid:" */
     if (!p) return 0;

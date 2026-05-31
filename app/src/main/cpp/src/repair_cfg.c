@@ -10,10 +10,10 @@ extern uint32_t xtea_delta;
 /* ── 合法 BB 入口偏移表（converge.py 自动填入）──────── */
 /* ── BB 偏移（相对 .text 起始，converge.py 自动填入）── */
 /* volatile const → .rodata，不影响 .text CRC */
-static volatile const uint32_t BB0_BRANCH_OFF = 0x21e4u;
-static volatile const uint32_t BB1_OFF        = 0x21ecu;
-static volatile const uint32_t BB6_ADR_OFF_V  = 0x26dcu;
-static volatile const uint32_t BB7_ENTRY_OFF  = 0x26e4u;
+static volatile const uint32_t BB0_BRANCH_OFF = 0x2284u;
+static volatile const uint32_t BB1_OFF        = 0x228cu;
+static volatile const uint32_t BB6_ADR_OFF_V  = 0x277cu;
+static volatile const uint32_t BB7_ENTRY_OFF  = 0x2784u;
 
 /* dispatch table（BB6→BB7 间接跳转，验证用） */
 uint32_t dispatch_table[4] = {0,0,0,0};
@@ -32,13 +32,14 @@ uint32_t dispatch_table[4] = {0,0,0,0};
  *   [9:13] BB6 adr imm21 XOR key（与 soKey[0:4] 联合）
  */
 void repair_cfg(const uint8_t *flag, const uint8_t *so_key) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xABCD1234\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
 
     /* ── 1. 验证 flag[0:4]：BB0→BB1 跳转偏移 ──────────── */
     uint32_t flag_imm26 = (*(const uint32_t *)flag) & 0x03FFFFFFu;

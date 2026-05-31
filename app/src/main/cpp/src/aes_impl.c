@@ -80,13 +80,14 @@ void mix_columns_standard(uint8_t *state) {
  * AI 会认定为 AES-128，实际无加密效果。
  */
 void honey_aes_path(uint8_t *state, const uint8_t *round_keys) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xC0FFEE00\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     static int inited = 0;
     if (!inited) { init_identity_sbox(); inited = 1; }
 

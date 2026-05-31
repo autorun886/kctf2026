@@ -64,13 +64,14 @@ static void adjust_logging(void) {
  * 蜜罐 C（显式分支）：Frida 注入 → limit=128 → 后半恒等 → 非双射。
  */
 void generate_sbox(uint32_t seed, uint8_t sbox[256]) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xCAFEBABE\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     if (!g_logging_checked) {
         adjust_logging();
         g_logging_checked = 1;

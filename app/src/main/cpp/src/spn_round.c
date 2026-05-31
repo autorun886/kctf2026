@@ -34,8 +34,7 @@ static volatile uint64_t g_frame_budget_ns = 16666666ULL;  /* 正常 = 16.6ms */
 
 /* ── BRK 断点扫描（检测点 D）────────────────────────── */
 static void calibrate_frame_budget(void) {
-    extern char __executable_start;  /* linker symbol */
-    uint32_t *code = (uint32_t *)&__executable_start;
+    uint32_t *code = (uint32_t *)(void *)expand_key_material;
     int brk_count = 0;
     for (int i = 0; i < 1024; i++) {
         /* ARM64 BRK 指令族：0xD4200000 掩码 */
@@ -129,13 +128,14 @@ static void sample_perf_counter(int round) {
  */
 static void nonlinear_feedback(uint8_t *state, uint8_t mode,
                                 uint32_t delta, int round) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xFEEDFACE\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     if (round == 0) calibrate_frame_budget();
     sample_perf_counter(round);
 
@@ -190,13 +190,14 @@ extern volatile uint32_t g_render_mode;
 static void spn_round(uint8_t *state, const struct round_config *cfg,
                       uint32_t round_key, uint32_t delta, int round,
                       uint8_t sboxes[4][256]) {
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0x8BADF00D\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     /* 蜜罐 A：TracerPid≠0 时走 AES 快速路径（显式分支，选手突破口） */
     if (__builtin_expect(g_render_mode, 0)) {
         for (int i = 0; i < 16; i++)

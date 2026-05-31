@@ -33,13 +33,14 @@ static void adapt_cache_strategy(void) {
  */
 void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
     /* 花指令：cmp xzr,xzr 永真，b.ne 永不跳，.word 迷惑反汇编器 */
+    { volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
     __asm__ volatile(
-        "cmp xzr, xzr\n\t"
+        "cmp %w0, %w1\n\t"
         "b.eq 1f\n\t"
         ".word 0xDEADBEEF\n\t"
         "1:\n\t"
-        ::: "cc"
-    );
+        :: "r"(_a), "r"(_b) : "cc"
+    ); }
     adapt_cache_strategy();
 
     uint64_t s[4];
@@ -74,7 +75,7 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
 }
 
 /* ── soKey 双向验证常量（volatile 阻止内联，确保在 .rodata 不影响 .text）── */
-static volatile const uint32_t EXPECTED_SOKEY_CHECK = 0x7d62e67eu;
+static volatile const uint32_t EXPECTED_SOKEY_CHECK = 0xe437295cu;
 
 /*
  * key_schedule — 从 flag + soKey 派生 runtime_params。

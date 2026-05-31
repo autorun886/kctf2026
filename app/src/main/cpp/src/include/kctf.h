@@ -49,3 +49,6 @@ void *get_func(const char *name);
 void *get_func_by_id(int id);   /* 0=clock_gettime 1=fopen 2=fgets 3=fclose
                                     4=open 5=read 6=close 7=mprotect */
 const char *get_string(int id);
+
+/* 不透明谓词（nativeProcessInput 入口写入 flag[0]，花指令用此做条件） */
+extern volatile uint32_t g_opaque;
