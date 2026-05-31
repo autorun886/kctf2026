@@ -224,19 +224,34 @@ APK 内 libkctf.so → 解析 ELF → .text section → CRC32 → LCG 扩展 →
 
 ---
 
-## 十、花指令
+## 十、花指令（输入驱动不透明谓词）
 
-每个关键函数入口：
-```asm
-cmp xzr, xzr      ; Z=1 (永真)
-b.eq 1f            ; 永远跳转（跳过垃圾字节）
-.word 0xXXXXXXXX  ; 垃圾字节（IDA 尝试解码为指令）
-1:                 ; 真实代码
+```c
+// nativeProcessInput 入口：
+g_opaque = input[0];  // 用户输入的第一个字节
+
+// 各函数中的花指令：
+{ volatile uint32_t _a = g_opaque; volatile uint32_t _b = g_opaque;
+__asm__ volatile(
+    "cmp %w0, %w1\n\t"    // 比较两次 volatile 读取（运行时恒等）
+    "b.eq 1f\n\t"          // IDA 不知道相等，必须分析两条路径
+    ".word 0xDEADBEEF\n\t" // 垃圾字节
+    "1:\n\t"
+    :: "r"(_a), "r"(_b) : "cc"
+); }
 ```
 
-每处使用不同垃圾值（0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D 等），防止模式搜索批量 patch。
+**为什么 IDA 无法优化**：
+- `g_opaque` 是 `volatile` 全局变量，两次读取可能不同（IDA 必须保守假设）
+- 值来自用户输入 `input[0]`，静态分析时完全未知
+- 即使 IDA 猜测两次读取相等，也无法证明（volatile 语义）
 
-**IDA 效果**：`nativeProcessInput` 反编译失败（"decompile returned None"），选手必须看汇编。
+**为什么选手不能 patch**：
+- `input[0]` 同时是 `flagA[0]`，参与方案 A 的 `repair_cfg` 验证
+- Patch `g_opaque` 赋值 → `input[0]` 不再正确传递 → 方案 A 失败
+- Patch .text 任何字节 → soKey CRC 变化 → 全链路失败
+
+每处使用不同垃圾值（0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D 等），防止模式搜索批量 NOP。
 
 ---
 
