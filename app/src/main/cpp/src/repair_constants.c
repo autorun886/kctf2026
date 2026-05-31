@@ -15,9 +15,9 @@ static const uint32_t KPT[3][2] = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR，阻止 MOVZ/MOVK 内联到 .text（避免 CRC 振荡） */
 static volatile const uint32_t KCT[3][2] = {
-    {0x5b0527efu, 0x307f3912u},
-    {0x3e83cb6au, 0x76d9874au},
-    {0x1c22f78bu, 0x118ee828u}
+    {0xf41eb566u, 0x05ad8d82u},
+    {0x16275be9u, 0x4db01f1du},
+    {0xadfb320bu, 0x86502954u}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */

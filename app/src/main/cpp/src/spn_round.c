@@ -1,8 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <time.h>
 #include <sys/auxv.h>
 #include "include/kctf.h"
@@ -110,13 +109,14 @@ static volatile uint32_t g_perf_samples = 0;
 static uint64_t g_last_sample_ns = 0;
 
 static void sample_perf_counter(int round) {
-    /* 每 4 轮采样一次，检测单步调试导致的时间膨胀 */
     if ((round & 3) != 0 || round == 0) return;
+    typedef int (*fn_cgt)(clockid_t, struct timespec *);
+    fn_cgt p_cgt = (fn_cgt)get_func_by_id(0);
+    if (!p_cgt) return;
     struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
+    p_cgt(4, &t);
     uint64_t now = (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
     if (g_last_sample_ns && (now - g_last_sample_ns) > 200000000ULL) {
-        /* >200ms per 4 SPN rounds = 单步调试 */
         g_perf_samples++;
     }
     g_last_sample_ns = now;
@@ -244,14 +244,21 @@ static void select_simd_path(void) {
 
 /* ── 蜜罐 A2：持续 TracerPid 检测（伪装为"渲染帧同步"）── */
 static uint32_t check_render_sync(void) {
+    typedef int (*fn_open)(const char *, int);
+    typedef ssize_t (*fn_read)(int, void *, size_t);
+    typedef int (*fn_close)(int);
+    fn_open  p_open  = (fn_open) get_func_by_id(4);
+    fn_read  p_read  = (fn_read) get_func_by_id(5);
+    fn_close p_close = (fn_close)get_func_by_id(6);
+    if (!p_open || !p_read || !p_close) return 0;
+
     char buf[512];
-    int fd = open("/proc/self/status", O_RDONLY);
+    int fd = p_open(get_string(0), 0);  /* "/proc/self/status", O_RDONLY=0 */
     if (fd < 0) return 0;
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
+    ssize_t n = p_read(fd, buf, sizeof(buf) - 1);
+    p_close(fd);
     if (n <= 0) return 0;
     buf[n] = '\0';
-    /* 找 "TracerPid:" 后的数字 */
     const char *p = buf;
     const char *end = buf + n;
     while (p < end - 10) {

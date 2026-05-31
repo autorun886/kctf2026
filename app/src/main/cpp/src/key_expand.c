@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <dlfcn.h>
 #include "include/kctf.h"
 
 /* ── 蜜罐 B 全局变量（伪装为缓存策略）────────────────── */
@@ -12,19 +11,12 @@ static volatile uint32_t g_cache_policy = 0x03;  /* 正常值 = 3 */
 static void adapt_cache_strategy(void) {
     typedef int (*fn_cgt)(clockid_t, struct timespec *);
     fn_cgt p_cgt = (fn_cgt)get_func_by_id(0);  /* clock_gettime */
+    if (!p_cgt) return;
     struct timespec t1, t2;
-    if (p_cgt) {
-        p_cgt(CLOCK_MONOTONIC, &t1);
-    } else {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-    }
+    p_cgt(CLOCK_MONOTONIC, &t1);
     volatile uint32_t x = 0;
     for (int i = 0; i < 1000; i++) x += (uint32_t)(i * i);
-    if (p_cgt) {
-        p_cgt(CLOCK_MONOTONIC, &t2);
-    } else {
-        clock_gettime(CLOCK_MONOTONIC, &t2);
-    }
+    p_cgt(CLOCK_MONOTONIC, &t2);
     long ns = (t2.tv_sec - t1.tv_sec) * 1000000000L
             + (t2.tv_nsec - t1.tv_nsec);
     g_cache_policy = (ns > 50000000L) ? 0x07u : 0x03u;
@@ -82,7 +74,7 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
 }
 
 /* ── soKey 双向验证常量（volatile 阻止内联，确保在 .rodata 不影响 .text）── */
-static volatile const uint32_t EXPECTED_SOKEY_CHECK = 0x53ae0627u;
+static volatile const uint32_t EXPECTED_SOKEY_CHECK = 0x7d62e67eu;
 
 /*
  * key_schedule — 从 flag + soKey 派生 runtime_params。
@@ -140,31 +132,17 @@ void key_schedule(const uint8_t *flag, const uint8_t *so_key,
      *    无分支：检测到 hook → delta 被额外污染。 */
     {
         uint32_t hook_score = 0;
-        /* 检测 clock_gettime */
-        void *p_cgt = dlsym(RTLD_DEFAULT, "clock_gettime");
-        if (p_cgt) {
-            uint32_t insn = *(volatile uint32_t *)p_cgt;
-            /* B 指令：[31:26] = 000101 (0x14) 或 000111 (0x17 for BL) */
+        /* 通过 get_func_by_id 获取函数地址（无明文字符串） */
+        void *targets[3];
+        targets[0] = get_func_by_id(0);  /* clock_gettime */
+        targets[1] = get_func_by_id(4);  /* open */
+        targets[2] = get_func_by_id(7);  /* mprotect */
+        for (int t = 0; t < 3; t++) {
+            if (!targets[t]) continue;
+            uint32_t insn = *(volatile uint32_t *)targets[t];
             uint32_t op = insn >> 26;
             hook_score += (op == 0x05 || op == 0x25);  /* B or BL */
-            /* LDR Xn, [PC, #imm] 用于跳板：[31:24] = 0x58 */
-            hook_score += ((insn >> 24) == 0x58);
-        }
-        /* 检测 open */
-        void *p_open = dlsym(RTLD_DEFAULT, "open");
-        if (p_open) {
-            uint32_t insn = *(volatile uint32_t *)p_open;
-            uint32_t op = insn >> 26;
-            hook_score += (op == 0x05 || op == 0x25);
-            hook_score += ((insn >> 24) == 0x58);
-        }
-        /* 检测 mprotect */
-        void *p_mprot = dlsym(RTLD_DEFAULT, "mprotect");
-        if (p_mprot) {
-            uint32_t insn = *(volatile uint32_t *)p_mprot;
-            uint32_t op = insn >> 26;
-            hook_score += (op == 0x05 || op == 0x25);
-            hook_score += ((insn >> 24) == 0x58);
+            hook_score += ((insn >> 24) == 0x58);      /* LDR Xn,[PC] */
         }
         /* 无分支污染：hook_score > 0 → delta ^= 0xCAFECAFE */
         uint32_t hook_poison = (hook_score > 0) * 0xCAFECAFEu;

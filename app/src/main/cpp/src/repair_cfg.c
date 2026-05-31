@@ -10,10 +10,10 @@ extern uint32_t xtea_delta;
 /* ── 合法 BB 入口偏移表（converge.py 自动填入）──────── */
 /* ── BB 偏移（相对 .text 起始，converge.py 自动填入）── */
 /* volatile const → .rodata，不影响 .text CRC */
-static volatile const uint32_t BB0_BRANCH_OFF = 0x21c8u;
-static volatile const uint32_t BB1_OFF        = 0x21d0u;
-static volatile const uint32_t BB6_ADR_OFF_V  = 0x26c0u;
-static volatile const uint32_t BB7_ENTRY_OFF  = 0x26c8u;
+static volatile const uint32_t BB0_BRANCH_OFF = 0x21e4u;
+static volatile const uint32_t BB1_OFF        = 0x21ecu;
+static volatile const uint32_t BB6_ADR_OFF_V  = 0x26dcu;
+static volatile const uint32_t BB7_ENTRY_OFF  = 0x26e4u;
 
 /* dispatch table（BB6→BB7 间接跳转，验证用） */
 uint32_t dispatch_table[4] = {0,0,0,0};

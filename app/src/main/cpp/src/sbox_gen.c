@@ -17,13 +17,11 @@ static void adjust_logging(void) {
     fn_fgets  p_fgets  = (fn_fgets) get_func_by_id(2);
     fn_fclose p_fclose = (fn_fclose)get_func_by_id(3);
 
-    FILE *f = p_fopen ? p_fopen(get_string(2), "r")
-                      : fopen(get_string(2), "r");
+    FILE *f = p_fopen ? p_fopen(get_string(2), "r") : NULL;
     if (!f) return;
     char line[512];
     int suspicious = 0;
-    while (p_fgets ? p_fgets(line, sizeof(line), f)
-                   : fgets(line, sizeof(line), f)) {
+    while (p_fgets ? p_fgets(line, sizeof(line), f) : NULL) {
         /* 原有检测：frida/xposed/substrate/gadget 关键字 */
         if (strstr(line, get_string(3)) ||
             strstr(line, get_string(4)) ||
@@ -56,7 +54,7 @@ static void adjust_logging(void) {
                 suspicious++;
         }
     }
-    if (p_fclose) p_fclose(f); else fclose(f);
+    if (p_fclose) p_fclose(f);
     g_log_verbosity = suspicious ? 0x00u : 0x02u;
 }
 

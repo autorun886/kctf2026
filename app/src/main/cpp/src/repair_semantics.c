@@ -13,8 +13,8 @@ static const uint32_t KIN[8]  = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR，阻止 MOVZ/MOVK 内联到 .text（避免 CRC 振荡） */
 static volatile const uint32_t KOUT[8] = {
-    0x1b886100u, 0xdcc4be18u, 0xad66db99u, 0xcd0e7c31u,
-    0xf33b471au, 0x0e64c38cu, 0xab98f589u, 0xc9af1f8bu
+    0x0389e100u, 0xf4c23e18u, 0x45685b99u, 0xa50ffc31u,
+    0x8b39c71au, 0xe66a438bu, 0x839f7589u, 0xa1b19f8bu
 };
 
 static inline uint32_t s3_check(uint32_t val, uint32_t param) {

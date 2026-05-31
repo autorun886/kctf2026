@@ -38,7 +38,7 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
         sbox_shipped[(i + offset) & 0xFFu] ^= key_stream[i];
 
     /* 已知对验证：3 字节约束，把有效 seed 从 ~1.6 亿压到 ~1 个 */
-    static volatile const uint8_t SBOX_CHECK[3] = {0xad, 0x71, 0x73};  /* converge.py 填入 */
+    static volatile const uint8_t SBOX_CHECK[3] = {0x03, 0x62, 0x02};  /* converge.py 填入 */
     /* volatile 局部变量强制内存加载，阻止编译器将值编码为 .text 立即数（避免 CRC 振荡） */
     volatile uint8_t sc0 = SBOX_CHECK[0];
     volatile uint8_t sc1 = SBOX_CHECK[1];
