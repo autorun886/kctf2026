@@ -243,7 +243,7 @@ print(f"[*] Match target2: {result2 == target2}")
 
 # ═══ Z3 求解：约束 material == expected ═══
 solver = Solver()
-solver.set("timeout", 3600000)  # 1 hour timeout
+solver.set("timeout", 86400000)  # 24 hours timeout
 
 for i in range(96):
     solver.add(material_sym[i] == BitVecVal(expected_material[i], 8))
