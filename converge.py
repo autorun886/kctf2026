@@ -351,7 +351,7 @@ def compute_kct_kout(flag_bytes, soKey, bb_addrs):
     # --- compute KCT (3 XTEA pairs) ---
     def xtea_check(v0, v1):
         da = 0
-        for r in range(12):
+        for r in range(16):
             da = (da + xtea_delta) & 0xFFFFFFFF
             v0 = (v0 + ((((v1 << 4) ^ (v1 >> 5)) + v1) ^ (da + rc[r * 2]))) & 0xFFFFFFFF
             v1 = (v1 + ((((v0 << 4) ^ (v0 >> 5)) + v0) ^ (da + rc[r * 2 + 1]))) & 0xFFFFFFFF
