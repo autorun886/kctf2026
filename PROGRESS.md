@@ -247,3 +247,51 @@
   - BUILD SUCCESSFUL
 - **待完成**：运行 `converge.py --release` 重新收敛 → 验证 → 发布
 
+---
+
+## 2026-06-02
+
+- **真机验证与 Bug 修复**：
+  - 花指令 `b.ne` → `b.eq`（修复 SIGILL 崩溃）
+  - deriveNativeKey 重写：从 APK ZipFile 读取 .so（修复 Android 12+ 内嵌加载）
+  - repair_cfg 改为纯验证模式（不再 mprotect 写 .text）
+  - calibrate_frame_budget 中 `__executable_start` → `expand_key_material` 函数地址
+  - 蜜罐 E 改用 `getauxval()`（修复 /proc/self/auxv 权限问题）
+  - 蜜罐 B2 `g_perf_samples` 每次调用重置（修复跨调用累积误触发）
+  - 输入格式改为 hex（100 字符直接输入）
+  - Pixel 6 真机验证通过
+
+- **反调试加固**：
+  - 蜜罐 A2：持续 TracerPid 检测（SPN 执行期间）
+  - 蜜罐 F：inline hook 检测（libc 函数头 B/LDR 检测），改用 get_func_by_id
+  - 蜜罐 C 增强：大匿名可执行内存段 >2MB 检测
+  - 反 Unicorn：中间状态 CRC32 混入后 8 轮 round_key
+  - 动态函数调用：去掉 PLT fallback（fopen/fgets/fclose/clock_gettime）
+  - 花指令升级：输入驱动不透明谓词（g_opaque = input[0]，双 volatile 读取比较）
+
+- **ARX 轮数调整**：
+  - 16 轮 → Z3 24h 超时（不可解）
+  - 14 轮 → Z3 10.3 min（可解）
+  - 12 轮 → Z3 8.5 min（稳妥）
+  - 当前保留 12 轮
+
+- **Z3 可解性分析**：
+  - 纯 ARX 逆向（已知 material 96 字节）：12 轮 = 8.5 min ✓
+  - 选手只知 soKey check（32-bit 约束）：Z3 2h 超时 ✗
+  - 选手知 seeds + soKey check（160-bit 约束）：待验证（常量同步问题）
+  - **核心问题**：Fisher-Yates 不可符号化，选手无法把完整 SPN 放进 Z3
+  - **解决方案**：暴露 sbox_seeds[4] 给选手（16 字节），使 S-Box 可预计算
+
+- **当前状态**：
+  - Release APK 真机验证通过（12 轮 ARX）
+  - Z3 求解路径设计中：需要暴露 seeds 并验证选手可在合理时间内求解
+  - 常量需要重新同步（converge.py ESC 与 test 脚本不一致）
+
+- **待完成**：
+  1. 确定 seeds 暴露方式并实现
+  2. 重新收敛
+  3. 验证选手 Z3 路径（seeds known → 求解时间）
+  4. 真机验证
+  5. 更新文档和 flag
+
+

@@ -81,7 +81,7 @@ def rol64(x, n): return ((x << n) | (x >> (64 - n))) & ((1<<64)-1)
 def expand_key_material(flag_bytes):
     buf = bytearray(32); buf[:25] = flag_bytes; buf[25:] = b'\x5A' * 7
     s = list(struct.unpack_from('<4Q', buf))
-    for r in range(16):
+    for r in range(12):
         s[0] = (ror64(s[0], 8) + s[1]) & ((1<<64)-1); s[0] ^= r
         s[1] = rol64(s[1], 3) ^ s[0]
         s[2] = (ror64(s[2], 8) + s[3]) & ((1<<64)-1); s[2] ^= (r + 4)
@@ -189,7 +189,7 @@ def z3_expand(flag_bvs):
         for j in range(1, 8):
             s[i] = s[i] | (ZeroExt(56, buf[i*8+j]) << (j*8))
 
-    for r in range(16):
+    for r in range(12):
         s[0] = (z3_ror64(s[0], 8) + s[1]) ^ BitVecVal(r, 64)
         s[1] = z3_rol64(s[1], 3) ^ s[0]
         s[2] = (z3_ror64(s[2], 8) + s[3]) ^ BitVecVal(r + 4, 64)

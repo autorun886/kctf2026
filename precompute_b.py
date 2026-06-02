@@ -75,7 +75,7 @@ def expand_key_material(flag_bytes, out_len=96):
     buf[:25] = flag_bytes
     buf[25:] = bytes([0x5A] * 7)
     s = list(struct.unpack_from('<4Q', buf))
-    for r in range(16):
+    for r in range(12):
         s[0] = (ror64(s[0], 8) + s[1]) & ((1<<64)-1)
         s[0] ^= r
         s[1] = rol64(s[1], 3) ^ s[0]

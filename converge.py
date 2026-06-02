@@ -301,7 +301,7 @@ def expand_key_material(flag_bytes, out_len=96):
     buf[:25] = flag_bytes
     buf[25:] = bytes([0x5A] * 7)
     s = list(struct.unpack_from("<4Q", buf))
-    for r in range(16):
+    for r in range(12):
         s[0] = (ror64(s[0], 8) + s[1]) & ((1 << 64) - 1)
         s[0] ^= r
         s[1] = rol64(s[1], 3) ^ s[0]
@@ -351,7 +351,7 @@ def compute_kct_kout(flag_bytes, soKey, bb_addrs):
     # --- compute KCT (3 XTEA pairs) ---
     def xtea_check(v0, v1):
         da = 0
-        for r in range(16):
+        for r in range(12):
             da = (da + xtea_delta) & 0xFFFFFFFF
             v0 = (v0 + ((((v1 << 4) ^ (v1 >> 5)) + v1) ^ (da + rc[r * 2]))) & 0xFFFFFFFF
             v1 = (v1 + ((((v0 << 4) ^ (v0 >> 5)) + v0) ^ (da + rc[r * 2 + 1]))) & 0xFFFFFFFF

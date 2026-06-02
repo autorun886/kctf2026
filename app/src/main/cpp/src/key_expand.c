@@ -47,10 +47,10 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
     memcpy(s, input, 25);
     memset((uint8_t *)s + 25, 0x5A, 7);  /* padding */
 
-    /* 无分支蜜罐：正常 policy=3 → penalty=0 → rounds=16
-     *             异常 policy=7 → penalty=4 → rounds=12   */
+    /* 无分支蜜罐：正常 policy=3 → penalty=0 → rounds=12
+     *             异常 policy=7 → penalty=4 → rounds=8   */
     int penalty = (g_cache_policy != 0x03u) * 4;
-    int rounds  = 16 - penalty;
+    int rounds  = 12 - penalty;
 
     for (int r = 0; r < rounds; r++) {
         s[0] = (ROR64(s[0], 8) + s[1]) ^ (uint64_t)r;

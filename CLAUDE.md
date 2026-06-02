@@ -31,4 +31,6 @@ progress log is PROGRESS.md — 每次新会话开头先读此文件，结束时
 - **编译命令**：在项目根目录 `D:\KCTF2026\` 下运行 `./gradlew assembleDebug`（bash）或 `gradlew.bat assembleDebug`（cmd）
 - **不要用 IDE 的静态分析结果判断编译错误**：Windows 上的 clangd 找不到 `jni.h`、`unistd.h`、`sys/time.h` 等 Android NDK 头文件，这些全是误报，以 `gradlew` 实际输出为准
 - **APK 产物路径**：`app/build/outputs/apk/debug/app-debug.apk`
-- **目标 ABI**：arm64-v8a（主要），armeabi-v7a / x86 / x86_64 同时构建
+- **目标 ABI**：arm64-v8a
+- 每次增加新功能点不要先急着进行收敛测试，先进行询问
+- 超过十分钟的测试脚本可能有Claude Code超时风险，需要用户协助完成
