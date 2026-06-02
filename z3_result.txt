@@ -1,0 +1,22 @@
+KCTF2026 Z3 Solver Result (Windows Multi-threaded)
+============================================================
+Solver: Z3 4.13.0
+Platform: Windows | Workers: 16
+Strategy: ARX inversion (material constraint)
+ARX rounds: 16 | SPN rounds: 16 (8 static + 8 dynamic)
+CRC32 mix: yes (at round 8) | Dual IV: yes
+
+soKey: 0626fbb9ea5656a6b101fe996205b6b0
+EXPECTED_SOKEY_CHECK: 0xe437295c
+target1: 3f23fefd1490ea50915abf979880925b
+target2: 07fe4c3f03850ba74396613d8b82d2e9
+
+Build time: 0.1s
+Solve time: 86408.5s
+Total time: 86408.6s
+Z3 Result: unknown
+
+No solution found (Z3 timeout/unknown)
+Tip: re-run with --brute-force to enable parallel brute-force fallback
+
+============================================================
