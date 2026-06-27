@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "include/kctf.h"
+#include "include/const_xor.h"
 
 /* ── 硬编码 IV（方案 B）─────────────────────────────────── */
 static volatile const uint8_t IV[STATE_LEN] = {
@@ -9,10 +10,10 @@ static volatile const uint8_t IV[STATE_LEN] = {
     0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10
 };
 
-/* ── 加密后的目标状态（precompute_b.py，Release build，CRC=2ba68be6）── */
-static volatile const uint8_t ENC_EXPECTED_STATE[STATE_LEN] = {
-    0x39, 0x05, 0x05, 0x44, 0xFE, 0xC6, 0xBC, 0xF6,
-    0x20, 0x5B, 0x41, 0x0E, 0xFA, 0x85, 0x24, 0xEB
+/* 方案 B 第一次 SPN 目标（XOR 加密存储，converge.py 填入） */
+static volatile const uint8_t ENC_EXPECTED_STATE_ENC[STATE_LEN] = {
+    0xF5, 0x41, 0x9B, 0x0A, 0xBF, 0xBA, 0xC8, 0x46,
+    0xD6, 0x21, 0xFB, 0x1E, 0xAD, 0x3B, 0x37, 0x76
 };
 
 /* ── 第二 IV（唯一性约束，与 IV1 不同）──────────────────── */
@@ -21,16 +22,16 @@ static volatile const uint8_t IV2[STATE_LEN] = {
     0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0
 };
 
-/* ── 第二次 SPN 目标状态（converge.py 收敛后填入）────────── */
-static volatile const uint8_t ENC_EXPECTED_STATE2[STATE_LEN] = {
-    0x01, 0xD8, 0xB7, 0x86, 0xE9, 0xD3, 0x5D, 0x01,
-    0xF2, 0x97, 0x9F, 0xA4, 0xE9, 0x87, 0x64, 0x59
+/* 方案 B 第二次 SPN 目标（XOR 加密存储，converge.py 填入） */
+static volatile const uint8_t ENC_EXPECTED_STATE2_ENC[STATE_LEN] = {
+    0xCB, 0x43, 0x9E, 0xC9, 0x39, 0x44, 0xA3, 0x1B,
+    0x4D, 0xF2, 0x5D, 0x54, 0x60, 0x3E, 0x07, 0x1D
 };
 
-/* ── 方案 A 目标状态（precompute_a.py，Release build，CRC=2ba68be6）── */
-static volatile const uint8_t ENC_EXPECTED_STATE_A[STATE_LEN] = {
-    0x5D, 0xEA, 0xE0, 0x84, 0x4B, 0x27, 0x79, 0x1A,
-    0xF7, 0x95, 0x11, 0xB8, 0x3C, 0x83, 0xFE, 0x42
+/* 方案 A 目标状态（XOR 加密存储，converge.py 填入） */
+static volatile const uint8_t ENC_EXPECTED_STATE_A_ENC[STATE_LEN] = {
+    0x4B, 0xD9, 0x6F, 0xC8, 0x1E, 0xDB, 0x86, 0x9F,
+    0x20, 0xBD, 0x99, 0xE4, 0xAC, 0xDD, 0x9D, 0xFB
 };
 
 /* ── JNI 回调获取 soKey ──────────────────────────────────── */
@@ -73,8 +74,9 @@ static int verify_scheme_a(const uint8_t *flagA, const uint8_t *soKey) {
     }
 
     uint8_t expected[STATE_LEN];
+    const_xor_load(expected, (const uint8_t *)ENC_EXPECTED_STATE_A_ENC, STATE_LEN);
     for (int i = 0; i < STATE_LEN; i++)
-        expected[i] = ENC_EXPECTED_STATE_A[i] ^ soKey[i];
+        expected[i] ^= soKey[i];
 
     volatile uint8_t diff = 0;
     for (int i = 0; i < STATE_LEN; i++)
@@ -137,6 +139,34 @@ static int verify_scheme_b(const uint8_t *flagB, const uint8_t *soKey) {
     struct runtime_params params;
     key_schedule(flagB, soKey, &params);
 
+    /* Oracle 比对：shellcode 返回 seeds[16] + material[0:16]
+     * 选手通过逆向 shellcode 得到这 32 字节构建 Z3 约束 */
+    extern volatile uint8_t g_sokey_for_oracle[16];
+    for (int i = 0; i < 16; i++)
+        g_sokey_for_oracle[i] = soKey[i];
+
+    uint8_t oracle_data[32];
+    if (get_oracle_material(oracle_data) != 0)
+        return 0;
+
+    /* oracle_data[0:16] = seeds, oracle_data[16:32] = material[0:16] */
+    /* 验证 seeds */
+    volatile uint8_t seeds_diff = 0;
+    uint8_t *expected_seeds = (uint8_t *)params.sbox_seeds;
+    for (int i = 0; i < 16; i++)
+        seeds_diff |= expected_seeds[i] ^ oracle_data[i];
+    if (seeds_diff != 0)
+        return 0;
+
+    /* 验证 material[0:16] */
+    uint8_t material_head[16];
+    expand_key_material(flagB, material_head, 16);
+    volatile uint8_t mat_diff = 0;
+    for (int i = 0; i < 16; i++)
+        mat_diff |= material_head[i] ^ oracle_data[16 + i];
+    if (mat_diff != 0)
+        return 0;
+
     uint8_t sboxes[SPN_SBOXES][256];
     for (int i = 0; i < SPN_SBOXES; i++)
         generate_sbox(params.sbox_seeds[i], sboxes[i]);
@@ -147,8 +177,9 @@ static int verify_scheme_b(const uint8_t *flagB, const uint8_t *soKey) {
     spn_encrypt(state, &params, sboxes);
 
     uint8_t expected[STATE_LEN];
+    const_xor_load(expected, (const uint8_t *)ENC_EXPECTED_STATE_ENC, STATE_LEN);
     for (int i = 0; i < STATE_LEN; i++)
-        expected[i] = ENC_EXPECTED_STATE[i] ^ soKey[i];
+        expected[i] ^= soKey[i];
 
     volatile uint8_t diff = 0;
     for (int i = 0; i < STATE_LEN; i++)
@@ -160,8 +191,9 @@ static int verify_scheme_b(const uint8_t *flagB, const uint8_t *soKey) {
     spn_encrypt(state2, &params, sboxes);
 
     uint8_t expected2[STATE_LEN];
+    const_xor_load(expected2, (const uint8_t *)ENC_EXPECTED_STATE2_ENC, STATE_LEN);
     for (int i = 0; i < STATE_LEN; i++)
-        expected2[i] = ENC_EXPECTED_STATE2[i] ^ soKey[i];
+        expected2[i] ^= soKey[i];
 
     volatile uint8_t diff2 = 0;
     for (int i = 0; i < STATE_LEN; i++)

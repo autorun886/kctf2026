@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "include/kctf.h"
+#include "include/const_xor.h"
 
 extern uint8_t  sbox_shipped[256];
 extern uint32_t round_constants[32];
@@ -13,11 +14,11 @@ static const uint32_t KPT[3][2] = {
     {0xdeadbeefu, 0xcafebabeu},
     {0x12345678u, 0x9abcdef0u}
 };
-/* volatile 强制编译器从 .rodata 生成 LDR，阻止 MOVZ/MOVK 内联到 .text（避免 CRC 振荡） */
-static volatile const uint32_t KCT[3][2] = {
-    {0xf58de49bu, 0x001743d1u},
-    {0x6be0676fu, 0xc04f8f0cu},
-    {0xd0896eb4u, 0x87ed2921u}
+/* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
+static volatile const uint32_t KCT_ENC[3][2] = {
+    {0x7678860bu, 0xa4382c47u},
+    {0x97ba2eabu, 0xbffb1149u},
+    {0x73e1b82fu, 0x34b86f03u}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */
@@ -60,7 +61,7 @@ void repair_constants(const uint8_t *flag, uint8_t sbox_first) {
     else        { clock_gettime(CLOCK_MONOTONIC, &t2); }
     long ns = (t2.tv_sec - t1.tv_sec) * 1000000000L + (t2.tv_nsec - t1.tv_nsec);
     /* 无分支：正常 penalty=0，调试器导致时间膨胀 penalty=8 */
-    int penalty = (ns > 50000000L) * 8;
+    int penalty = (ns > 200000000L) * 8;
 
     xtea_delta = *(const uint32_t *)(flag + 13);
 
@@ -75,12 +76,14 @@ void repair_constants(const uint8_t *flag, uint8_t sbox_first) {
     }
 
     /* KPT/KCT 验证：确认 xtea_delta + round_constants 正确 */
+    uint8_t cx_key[16];
+    get_const_xor_key(cx_key);
     for (int i = 0; i < 3; i++) {
         uint32_t v[2] = {KPT[i][0], KPT[i][1]};
         xtea_check_encrypt(v);
-        /* volatile 读取阻止编译器将 KCT 值编码为立即数（避免 .text CRC 随值变化） */
-        volatile uint32_t kct0 = KCT[i][0];
-        volatile uint32_t kct1 = KCT[i][1];
+        /* XOR 解密 KCT 值（volatile 确保从 .rodata 加载，不受 .text CRC 影响） */
+        volatile uint32_t kct0 = KCT_ENC[i][0] ^ *(const volatile uint32_t *)&cx_key[(i * 8) & 0xF];
+        volatile uint32_t kct1 = KCT_ENC[i][1] ^ *(const volatile uint32_t *)&cx_key[(i * 8 + 4) & 0xF];
         if (v[0] != kct0 || v[1] != kct1) {
             xtea_delta ^= 1u;  /* 蜜罐：delta 差 1，core_compute 结果错误 */
             return;

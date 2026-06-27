@@ -295,3 +295,83 @@
   5. 更新文档和 flag
 
 
+---
+
+## 2026-06-05
+
+- **Z3 可解性完整验证**：
+  - seeds only (128 bits): 12h 超时 ✗
+  - seeds + sokey_check (160 bits): 12h 超时 ✗
+  - 反推 squeeze 优化（直接约束 ARX 末态 s[2]+s[3]）: 12h 超时 ✗
+  - 无 cross-mix 12 轮: 2h 超时 ✗（根因是 modular ADD 的 carry chain）
+  - material[0:32] (256 bits, 直接 ARX 输出): **50s ✓**
+  - material[0:24] (192 bits): 超时 ✗
+  - **seeds + material[0:16] (288 bits 混合深度): 4.3 min ✓** ← 最终方案
+
+- **Oracle 暴露方案确定**：
+  - 原计划 seeds only 不可行（Z3 无法求解）
+  - 最终方案：oracle shellcode 返回 `seeds[16] + material[0:16]` = 32 字节
+  - 相比原计划仅多暴露 16 字节（material[0:16] = round_keys[0:4]）
+  - 选手需理解 ARX + squeeze + key_schedule 全链路才能正确建模
+  - Z3 求解时间 ~4 min，难度合理
+
+- **Oracle shellcode 实现完成**（seeds_oracle.S + seeds_oracle.c）：
+  - ARM64 position-independent shellcode，全部系统调用用 SVC
+  - 反调试：SVC openat+read `/proc/self/status`，解析 TracerPid
+  - 反 Frida：SVC 读 `/proc/self/maps`，扫描 "frid"/"xpos"
+  - 反模拟执行：SVC 读 `/proc/self/auxv`，检查 AT_HWCAP
+  - 检测到异常 → SVC exit_group(1) 直接终止进程
+  - 通过 → 返回 32 字节嵌入数据
+
+- **Oracle XOR 加密 + getkey 蜜罐**：
+  - shellcode 在 .rodata 中 XOR 加密存储
+  - 运行时 mmap RWX → 解密 → 执行 → memset 清零 → munmap
+  - `get_oracle_key()` 含蜜罐：`g_cached_key`（假值）+ `g_key_debug_override`
+
+- **3-Share Key 保护**（getkey 升级）：
+  - Share 0: MBA 混淆 Feistel（SHA-256 IV 常量内嵌为 immediate，不在 .rodata）
+  - Share 1: expand_key_material 函数前 128 字节代码的 CRC32（self-referential）
+  - Share 2: soKey 字节旋转 XOR 变换（绑定 APK 完整性）
+  - final_key = share_0 ⊕ share_1 ⊕ share_2
+  - 选手需同时还原三条路径才能解密 shellcode
+
+- **converge.py 更新**：
+  - `compute_oracle_xor_key(so_path, soKey)`: 动态计算 3-share key
+  - `patch_oracle_material()`: 写入 seeds[16] + material[0:16] 到 .so
+  - `encrypt_oracle_section()`: XOR 加密 oracle shellcode 区间
+
+- **题解 + Keygen 完成**：
+  - SOLUTION.md: 完整中文题解（信息收集→oracle 逆向→Z3 建模→方案 A 构造）
+  - keygen.py: 自包含求解脚本（APK 解析 + 3-share 解密 + Z3 求解 + SPN 验证）
+
+- **BUILD SUCCESSFUL**（Debug）
+
+- **当前状态**：
+  - Oracle 模块代码完成，待收敛（converge.py 需要新的 3-share key 计算）
+  - 方案 A/B 主流程逻辑完整
+  - 待完成：运行 converge.py --release 收敛 → 真机验证 → 最终提交
+
+
+
+---
+
+## 2026-06-07
+
+- **Oracle shellcode 材料偏移修复**：
+  - 根因：converge.py 计算 `material_va = end_va - 4 - 32`（假设 sentinel 在 oracle_code_end 前），实际 seeds_oracle.S 中 sentinel 在 label 后
+  - 修复：`material_va = end_va - 32`
+  - 症状：设备上 oracle 返回数据偏移 4 字节（`data0=a1dd6c96` 实际是 expected_seeds[4:8]）
+- **const_xor 禁用**：
+  - 原因：自引用 CRC 读取 expand_key_material 函数指针导致 SIGSEGV (`fault addr 0xab6f6bbd`)
+  - 方案：const_xor.c 返回全零密钥，.rodata 常量明文存储
+  - 影响：不影响核心验证逻辑，仅移除额外反静态分析层
+- **最终收敛成功**（debug build，6 轮迭代）：
+  - CRC32(.text) = `5390cc99`（稳定）
+  - soKey = `ebdd0b14...`
+  - 50-byte flag (hex): `017a00e3001b009401d2045600f8000c0041ebb7dd290b8e1463b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
+- **真机验证通过**：
+  - 设备：Pixel 6 Pro (Android 15)
+  - `nativeProcessInput result=1` ✅
+  - Toast: "Correct! Flag accepted."
+- **状态**：✅ 挑战完成，核心逻辑全部验证通过
+

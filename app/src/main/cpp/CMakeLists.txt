@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
-project("kctf")
+project("kctf" LANGUAGES C ASM)
 
 # ── 编译隔离：禁止 LTO，防止编译器合并相似函数/常量
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-lto -fno-merge-all-constants -fvisibility=hidden")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lto -fno-merge-all-constants -fvisibility=hidden")
+set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fno-lto -fvisibility=hidden")
 
 # ── 共享源文件（两方案均使用）
 set(SHARED_SRCS
@@ -22,6 +23,9 @@ set(SCHEME_B_SRCS
     src/sbox_gen.c
     src/spn_round.c
     src/jni_entry.c
+    src/seeds_oracle.c
+    src/const_xor.c
+    src/seeds_oracle.S
 )
 
 # ── 方案 A 源文件

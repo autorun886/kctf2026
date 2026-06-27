@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include "include/kctf.h"
+#include "include/const_xor.h"
 
 /* ── 蜜罐 B 全局变量（伪装为缓存策略）────────────────── */
 static volatile uint32_t g_cache_policy = 0x03;  /* 正常值 = 3 */
@@ -19,7 +20,7 @@ static void adapt_cache_strategy(void) {
     p_cgt(CLOCK_MONOTONIC, &t2);
     long ns = (t2.tv_sec - t1.tv_sec) * 1000000000L
             + (t2.tv_nsec - t1.tv_nsec);
-    g_cache_policy = (ns > 50000000L) ? 0x07u : 0x03u;
+    g_cache_policy = (ns > 200000000L) ? 0x07u : 0x03u;
 }
 
 /* ── ARX 辅助宏 ──────────────────────────────────────── */
@@ -74,8 +75,8 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
     }
 }
 
-/* ── soKey 双向验证常量（volatile 阻止内联，确保在 .rodata 不影响 .text）── */
-static volatile const uint32_t EXPECTED_SOKEY_CHECK = 0xe437295cu;
+/* soKey 双向验证常量（XOR 加密存储，converge.py 填入） */
+static volatile const uint32_t EXPECTED_SOKEY_CHECK_ENC = 0xb486524au;
 
 /*
  * key_schedule — 从 flag + soKey 派生 runtime_params。
@@ -121,8 +122,11 @@ void key_schedule(const uint8_t *flag, const uint8_t *so_key,
     /* 8. soKey 双向验证（无分支算术污染）
      *    正确 soKey → diff=0 → poison=0 → delta 不变
      *    错误 soKey → diff≠0 → poison=0xDEADBEEF → delta 被污染 */
+    uint8_t cx_key[16];
+    get_const_xor_key(cx_key);
+    uint32_t sokey_check_dec = EXPECTED_SOKEY_CHECK_ENC ^ *(const uint32_t *)cx_key;
     uint32_t check  = params->round_keys[15] ^ *(const uint32_t *)(so_key + 12);
-    uint32_t diff   = check ^ EXPECTED_SOKEY_CHECK;
+    uint32_t diff   = check ^ sokey_check_dec;
     uint32_t poison = ((diff | (~diff + 1u)) >> 31) * 0xDEADBEEFu;
     params->delta  ^= poison;
 

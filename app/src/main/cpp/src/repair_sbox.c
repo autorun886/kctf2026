@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "include/kctf.h"
+#include "include/const_xor.h"
 
 extern uint8_t  sbox_shipped[256];
 extern uint32_t dispatch_table[4];  /* repair_cfg 填入 */
@@ -38,12 +39,14 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
     for (int i = 0; i < 256; i++)
         sbox_shipped[(i + offset) & 0xFFu] ^= key_stream[i];
 
-    /* 已知对验证：3 字节约束，把有效 seed 从 ~1.6 亿压到 ~1 个 */
-    static volatile const uint8_t SBOX_CHECK[3] = {0xa7, 0x99, 0x4d};  /* converge.py 填入 */
-    /* volatile 局部变量强制内存加载，阻止编译器将值编码为 .text 立即数（避免 CRC 振荡） */
-    volatile uint8_t sc0 = SBOX_CHECK[0];
-    volatile uint8_t sc1 = SBOX_CHECK[1];
-    volatile uint8_t sc2 = SBOX_CHECK[2];
+    /* 已知对验证：3 字节约束（XOR 加密，converge.py 填入） */
+    static volatile const uint8_t SBOX_CHECK_ENC[3] = {0x81, 0xfe, 0xac};
+    /* XOR 解密后比较（volatile 强制 .rodata LDR 加载，避免 .text CRC 振荡） */
+    uint8_t cx_key[16];
+    get_const_xor_key(cx_key);
+    volatile uint8_t sc0 = SBOX_CHECK_ENC[0] ^ cx_key[0];
+    volatile uint8_t sc1 = SBOX_CHECK_ENC[1] ^ cx_key[1];
+    volatile uint8_t sc2 = SBOX_CHECK_ENC[2] ^ cx_key[2];
     if (sbox_shipped[0] != sc0 ||
         sbox_shipped[1] != sc1 ||
         sbox_shipped[2] != sc2) {

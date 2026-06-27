@@ -8,8 +8,6 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
-import java.io.BufferedReader;
-import java.io.FileReader;
 import java.io.InputStream;
 import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
@@ -60,21 +58,8 @@ public class MainActivity extends AppCompatActivity {
      */
     public byte[] deriveNativeKey() {
         try {
-            // Get APK path from /proc/self/maps
-            String apkPath = null;
-            try (BufferedReader br = new BufferedReader(new FileReader("/proc/self/maps"))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (line.contains("base.apk") && line.contains(" r-xp ")) {
-                        int idx = line.indexOf('/');
-                        if (idx >= 0) apkPath = line.substring(idx).trim();
-                        break;
-                    }
-                }
-            }
-            if (apkPath == null) {
-                return new byte[16];
-            }
+            // Get APK path directly from ApplicationInfo (reliable on all Android versions)
+            String apkPath = getApplicationInfo().sourceDir;
 
             // Determine ABI — try arm64-v8a first, then armeabi-v7a
             String[] abis = {"arm64-v8a", "armeabi-v7a", "x86_64", "x86"};

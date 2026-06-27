@@ -77,10 +77,11 @@ def find_gradlew():
 
 
 def build():
-    """Run gradle assemble, return True if successful."""
+    """Run gradle clean + assemble, return True if successful."""
     gw = find_gradlew()
-    log(f"Building: {GRADLE_TASK}")
-    r = subprocess.run([gw, GRADLE_TASK], cwd=ROOT,
+    log(f"Building: clean + {GRADLE_TASK}")
+    # Clean first to avoid stale build cache causing CRC oscillation
+    r = subprocess.run([gw, "clean", GRADLE_TASK], cwd=ROOT,
                        capture_output=True, text=True,
                        encoding="utf-8", errors="replace",
                        shell=(gw.endswith(".bat")))
@@ -115,6 +116,384 @@ def find_so():
             if f == "libkctf.so" and BUILD_TYPE in root_dir and "arm64-v8a" in root_dir:
                 return os.path.join(root_dir, f)
     raise FileNotFoundError(f"libkctf.so not found for {BUILD_TYPE}")
+
+
+# ── Oracle shellcode XOR 加密（构建后处理）──────────────────────
+# 与 seeds_oracle.c 中 get_oracle_key() 的 3-share 派生完全一致
+_KDF_IV = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+           0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
+
+def _mba_add(a, b):
+    return ((a ^ b) + ((a & b) << 1)) & 0xFFFFFFFF
+
+def _mba_xor(a, b):
+    return ((a | b) - (a & b)) & 0xFFFFFFFF
+
+def _mba_f(x, k):
+    x = _mba_add(x, k)
+    x = _mba_xor(x, (x >> 16))
+    x = (x * 0x45D9F3B) & 0xFFFFFFFF
+    x = _mba_xor(x, (x >> 16))
+    return x
+
+def _compute_share0_first():
+    """Share 0 前 8 字节: Feistel(c0^c2, c1^c3, keys=c4..c7)"""
+    c = _KDF_IV
+    L = _mba_xor(c[0], c[2])
+    R = _mba_xor(c[1], c[3])
+    for i in range(4):
+        tmp = R
+        R = _mba_xor(L, _mba_f(R, c[4 + i]))
+        L = tmp
+    return struct.pack('<II', L, R)
+
+def _compute_share0_second():
+    """Share 0 后 8 字节: Feistel(c4^c6, c5^c7, keys=c0..c3)"""
+    c = _KDF_IV
+    L = _mba_xor(c[4], c[6])
+    R = _mba_xor(c[5], c[7])
+    for i in range(4):
+        tmp = R
+        R = _mba_xor(L, _mba_f(R, c[i]))
+        L = tmp
+    return struct.pack('<II', L, R)
+
+def _crc32_half_byte(data):
+    """半字节 CRC32（与 C 代码一致）"""
+    T = [0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,
+         0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
+         0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,
+         0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C]
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        crc = ((crc >> 4) ^ T[crc & 0x0F]) & 0xFFFFFFFF
+        crc = ((crc >> 4) ^ T[crc & 0x0F]) & 0xFFFFFFFF
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+def _compute_share1(so_path):
+    """Share 1: expand_key_material 前 128 字节代码的 CRC32"""
+    # 找到 expand_key_material 的文件偏移
+    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
+    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+    if not os.path.isfile(nm):
+        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
+            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
+            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+            if os.path.isfile(nm):
+                break
+
+    with open(so_path, "rb") as f:
+        data = f.read()
+
+    out = subprocess.check_output([nm, "--defined-only", so_path], text=True,
+                                  encoding="utf-8", errors="replace")
+    syms = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            syms[parts[2]] = int(parts[0], 16)
+
+    func_va = syms.get("expand_key_material", 0)
+    if not func_va:
+        raise RuntimeError("expand_key_material symbol not found")
+
+    # VA → file offset
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+    func_foff = 0
+    for i in range(e_phnum):
+        ph = data[e_phoff + i*e_phentsize:e_phoff + (i+1)*e_phentsize]
+        p_type = struct.unpack_from("<I", ph, 0)[0]
+        if p_type != 1: continue
+        p_offset = struct.unpack_from("<Q", ph, 8)[0]
+        p_vaddr = struct.unpack_from("<Q", ph, 16)[0]
+        p_filesz = struct.unpack_from("<Q", ph, 32)[0]
+        if p_vaddr <= func_va < p_vaddr + p_filesz:
+            func_foff = p_offset + (func_va - p_vaddr)
+            break
+
+    code = data[func_foff:func_foff + 128]
+
+    # 前 8 字节: CRC(code[0:32]) + CRC(code[32:64])
+    crc_a = _crc32_half_byte(code[0:32])
+    crc_b = _crc32_half_byte(code[32:64])
+    first8 = struct.pack('<II', crc_a, crc_b)
+
+    # 后 8 字节: CRC(code[64:96]) + CRC(code[96:128])
+    crc_c = _crc32_half_byte(code[64:96])
+    crc_d = _crc32_half_byte(code[96:128])
+    second8 = struct.pack('<II', crc_c, crc_d)
+
+    return first8, second8
+
+def _compute_share2(soKey):
+    """Share 2: soKey 变换"""
+    sk = soKey
+    # 前 8 字节
+    first8 = bytearray(8)
+    for i in range(8):
+        a = sk[i]
+        b = sk[(i + 3) & 0x0F]
+        c = sk[(i + 7) & 0x0F]
+        first8[i] = a ^ ((b << 3) | (b >> 5)) & 0xFF ^ ((c << 5) | (c >> 3)) & 0xFF
+    # 修正：需要整体 & 0xFF
+    first8_fixed = bytearray(8)
+    for i in range(8):
+        a = sk[i]
+        b = sk[(i + 3) & 0x0F]
+        c = sk[(i + 7) & 0x0F]
+        first8_fixed[i] = (a ^ (((b << 3) | (b >> 5)) & 0xFF) ^ (((c << 5) | (c >> 3)) & 0xFF)) & 0xFF
+
+    # 后 8 字节
+    second8 = bytearray(8)
+    for i in range(8):
+        a = sk[8 + i]
+        b = sk[(i + 5) & 0x0F]
+        c = sk[(i + 11) & 0x0F]
+        second8[i] = (a ^ (((b << 2) | (b >> 6)) & 0xFF) ^ (((c << 6) | (c >> 2)) & 0xFF)) & 0xFF
+
+    return bytes(first8_fixed), bytes(second8)
+
+# ── Const XOR key (mirrors const_xor.c get_const_xor_key) ────────────
+# Same SHA-256 IV constants, different Feistel key ordering than oracle
+def _const_share0_first():
+    """Feistel(c0^c2, c1^c3, keys={c5,c6,c7,c4}) — 8 bytes"""
+    c = _KDF_IV
+    L = _mba_xor(c[0], c[2])
+    R = _mba_xor(c[1], c[3])
+    for k in (c[5], c[6], c[7], c[4]):
+        tmp = R
+        R = _mba_xor(L, _mba_f(R, k))
+        L = tmp
+    return struct.pack('<II', L, R)
+
+def _const_share0_second():
+    """Feistel(c4^c6, c5^c7, keys={c3,c2,c1,c0}) — 8 bytes"""
+    c = _KDF_IV
+    L = _mba_xor(c[4], c[6])
+    R = _mba_xor(c[5], c[7])
+    for k in (c[3], c[2], c[1], c[0]):
+        tmp = R
+        R = _mba_xor(L, _mba_f(R, k))
+        L = tmp
+    return struct.pack('<II', L, R)
+
+def compute_const_xor_key(so_path, soKey=None):
+    """Returns zero key (const_xor disabled for compatibility)"""
+    return bytes(16)
+
+# ── Helper: XOR encrypt a value with the const key ──────────────────
+def xor_encrypt_u32(value, key, offset):
+    """Encrypt a uint32 with cx_key[offset & 0xF : (offset+4) & 0xF]"""
+    k = struct.unpack_from('<I', key, offset & 0xF)[0]
+    return (value ^ k) & 0xFFFFFFFF
+
+def xor_encrypt_bytes(data, key):
+    """Encrypt a bytearray/bytes with cyclic key."""
+    return bytes(data[i] ^ key[i & 0xF] for i in range(len(data)))
+
+def compute_oracle_xor_key(so_path, soKey):
+    """计算 3-share oracle XOR key（需要 .so 路径和 soKey）"""
+    s0_first = _compute_share0_first()
+    s0_second = _compute_share0_second()
+    s1_first, s1_second = _compute_share1(so_path)
+    s2_first, s2_second = _compute_share2(soKey)
+
+    key = bytearray(16)
+    for i in range(8):
+        key[i] = s0_first[i] ^ s1_first[i] ^ s2_first[i]
+    for i in range(8):
+        key[8+i] = s0_second[i] ^ s1_second[i] ^ s2_second[i]
+
+    return bytes(key)
+
+# ORACLE_XOR_KEY 现在是动态计算的，不再是全局常量
+# 在 encrypt_oracle_section 中使用 compute_oracle_xor_key(so_path, soKey)
+
+
+def encrypt_oracle_section(so_path, soKey):
+    """XOR-encrypt the oracle shellcode in the .so.
+    Also patches the seeds data at the end of the shellcode.
+    Returns True if patched, False if section not found."""
+    oracle_key = compute_oracle_xor_key(so_path, soKey)
+    with open(so_path, "rb") as f:
+        data = bytearray(f.read())
+
+    # Parse ELF section headers to find oracle_code_start/end symbols
+    e_shoff = struct.unpack_from("<Q", data, 40)[0]
+    e_shentsize = struct.unpack_from("<H", data, 58)[0]
+    e_shnum = struct.unpack_from("<H", data, 60)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+
+    # Section name string table
+    sh = data[e_shoff + e_shstrndx * e_shentsize:e_shoff + (e_shstrndx + 1) * e_shentsize]
+    strtab_off = struct.unpack_from("<Q", sh, 24)[0]
+    strtab_size = struct.unpack_from("<Q", sh, 32)[0]
+    strtab = data[strtab_off:strtab_off + strtab_size]
+
+    # Find .rodata.oracle section
+    oracle_foff = oracle_size = 0
+    for i in range(e_shnum):
+        sh = data[e_shoff + i * e_shentsize:e_shoff + (i + 1) * e_shentsize]
+        ni = struct.unpack_from("<I", sh, 0)[0]
+        end = strtab.index(b"\x00", ni)
+        name = strtab[ni:end].decode()
+        if name == ".rodata.oracle":
+            oracle_foff = struct.unpack_from("<Q", sh, 24)[0]
+            oracle_size = struct.unpack_from("<Q", sh, 32)[0]
+            break
+
+    if oracle_foff == 0:
+        # Section might be merged into .rodata by linker — try symbol-based approach
+        return _encrypt_oracle_by_symbol(so_path, data, oracle_key)
+
+    # XOR encrypt the entire section
+    for i in range(oracle_size):
+        data[oracle_foff + i] ^= oracle_key[i & 0x0F]
+
+    with open(so_path, "wb") as f:
+        f.write(data)
+    log(f"  oracle section XOR-encrypted ({oracle_size} bytes at offset 0x{oracle_foff:x})")
+    return True
+
+
+def _encrypt_oracle_by_symbol(so_path, data, oracle_key):
+    """Fallback: find oracle_code_start/end via symbol table and XOR that range."""
+    # Use llvm-nm to find symbols
+    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
+    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+    if not os.path.isfile(nm):
+        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
+            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
+            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+            if os.path.isfile(nm):
+                break
+    if not os.path.isfile(nm):
+        log("  WARNING: llvm-nm not found, cannot encrypt oracle section")
+        return False
+
+    try:
+        out = subprocess.check_output([nm, "--defined-only", so_path], text=True,
+                                      encoding="utf-8", errors="replace")
+    except Exception:
+        log("  WARNING: llvm-nm failed on .so")
+        return False
+
+    syms = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            syms[parts[2]] = int(parts[0], 16)
+
+    start_va = syms.get("oracle_code_start", 0)
+    end_va = syms.get("oracle_code_end", 0)
+    if not start_va or not end_va or end_va <= start_va:
+        log("  WARNING: oracle_code_start/end symbols not found")
+        return False
+
+    code_size = end_va - start_va
+
+    # Convert VA to file offset: find the LOAD segment containing this VA
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+
+    file_offset = 0
+    for i in range(e_phnum):
+        ph = data[e_phoff + i * e_phentsize:e_phoff + (i + 1) * e_phentsize]
+        p_type = struct.unpack_from("<I", ph, 0)[0]
+        if p_type != 1:  # PT_LOAD
+            continue
+        p_offset = struct.unpack_from("<Q", ph, 8)[0]
+        p_vaddr = struct.unpack_from("<Q", ph, 16)[0]
+        p_filesz = struct.unpack_from("<Q", ph, 32)[0]
+        if p_vaddr <= start_va < p_vaddr + p_filesz:
+            file_offset = p_offset + (start_va - p_vaddr)
+            break
+
+    if file_offset == 0:
+        log("  WARNING: could not map oracle VA to file offset")
+        return False
+
+    # XOR encrypt
+    for i in range(code_size):
+        data[file_offset + i] ^= oracle_key[i & 0x0F]
+
+    with open(so_path, "wb") as f:
+        f.write(data)
+    log(f"  oracle shellcode XOR-encrypted ({code_size} bytes at file offset 0x{file_offset:x})")
+    return True
+
+
+def patch_oracle_material(so_path, material_32):
+    """Patch the 32 bytes material[0:32] into the oracle shellcode's .L_material_data.
+    Material data is at the end of oracle_code (32 bytes + 4 byte sentinel before oracle_code_end).
+    Must be called BEFORE encrypt_oracle_section."""
+    with open(so_path, "rb") as f:
+        data = bytearray(f.read())
+
+    # Find oracle_code_end symbol to locate material (32+4 bytes before it)
+    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
+    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+    if not os.path.isfile(nm):
+        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
+            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
+            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+            if os.path.isfile(nm):
+                break
+
+    try:
+        out = subprocess.check_output([nm, "--defined-only", so_path], text=True,
+                                      encoding="utf-8", errors="replace")
+    except Exception:
+        log("  WARNING: cannot patch oracle material (llvm-nm failed)")
+        return False
+
+    syms = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            syms[parts[2]] = int(parts[0], 16)
+
+    end_va = syms.get("oracle_code_end", 0)
+    if not end_va:
+        log("  WARNING: oracle_code_end symbol not found")
+        return False
+
+    # Layout: [.L_material_data: 32 bytes] [oracle_code_end] [sentinel: 4 bytes]
+    material_va = end_va - 32
+
+    # VA to file offset
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+
+    file_offset = 0
+    for i in range(e_phnum):
+        ph = data[e_phoff + i * e_phentsize:e_phoff + (i + 1) * e_phentsize]
+        p_type = struct.unpack_from("<I", ph, 0)[0]
+        if p_type != 1:
+            continue
+        p_offset = struct.unpack_from("<Q", ph, 8)[0]
+        p_vaddr = struct.unpack_from("<Q", ph, 16)[0]
+        p_filesz = struct.unpack_from("<Q", ph, 32)[0]
+        if p_vaddr <= material_va < p_vaddr + p_filesz:
+            file_offset = p_offset + (material_va - p_vaddr)
+            break
+
+    if file_offset == 0:
+        log("  WARNING: cannot map material VA to file offset")
+        return False
+
+    # Write 32 bytes
+    data[file_offset:file_offset + 32] = material_32
+
+    with open(so_path, "wb") as f:
+        f.write(data)
+    log(f"  oracle material[0:32] patched at file offset 0x{file_offset:x}")
+    return True
 
 
 # ── 步骤 3: soKey 派生（读取 .text section）─────────────────────
@@ -640,72 +1019,74 @@ def fmt_hex_row(data):
     return ", ".join(parts[:8]) + ",\n    " + ", ".join(parts[8:])
 
 
-def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc, flag_b64_a, sbox_check, bb_addrs=None):
-    """Write all computed constants back to source files."""
-    enc_a_str = fmt_hex_row(enc_a)
-    enc_b_str = fmt_hex_row(enc_b)
-    enc_b2_str = fmt_hex_row(enc_b2)
+def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc, flag_b64_a, sbox_check, bb_addrs=None, so_path=None):
+    """Write all computed constants back to source files (XOR-encrypted)."""
+    # Compute XOR key for constant protection
+    cx_key = compute_const_xor_key(so_path) if so_path else (b'\x00' * 16)
+
+    enc_a_enc = xor_encrypt_bytes(enc_a, cx_key)
+    enc_b_enc = xor_encrypt_bytes(enc_b, cx_key)
+    enc_b2_enc = xor_encrypt_bytes(enc_b2, cx_key)
+    enc_a_str = fmt_hex_row(enc_a_enc)
+    enc_b_str = fmt_hex_row(enc_b_enc)
+    enc_b2_str = fmt_hex_row(enc_b2_enc)
 
     changes = 0
 
-    # --- repair_constants.c: KCT array ---
+    # --- repair_constants.c: KCT_ENC array (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/repair_constants.c")
+    kct_enc = [[xor_encrypt_u32(KCT[i][j], cx_key, i * 8 + j * 4) for j in range(2)] for i in range(3)]
     new_kct = (
-        f"static volatile const uint32_t KCT[3][2] = {{\n"
-        f"    {{{KCT[0][0]:#010x}u, {KCT[0][1]:#010x}u}},\n"
-        f"    {{{KCT[1][0]:#010x}u, {KCT[1][1]:#010x}u}},\n"
-        f"    {{{KCT[2][0]:#010x}u, {KCT[2][1]:#010x}u}}\n"
+        f"static volatile const uint32_t KCT_ENC[3][2] = {{\n"
+        f"    {{{kct_enc[0][0]:#010x}u, {kct_enc[0][1]:#010x}u}},\n"
+        f"    {{{kct_enc[1][0]:#010x}u, {kct_enc[1][1]:#010x}u}},\n"
+        f"    {{{kct_enc[2][0]:#010x}u, {kct_enc[2][1]:#010x}u}}\n"
         f"}};"
     )
-    if update_file(src, r"static volatile const uint32_t KCT\[3\]\[2\] = \{[^;]+;", new_kct, multiline=True):
+    if update_file(src, r"static volatile const uint32_t KCT_ENC\[3\]\[2\] = \{[^;]+;", new_kct, multiline=True):
         changes += 1
-        log(f"  update repair_constants.c (KCT)")
+        log(f"  update repair_constants.c (KCT_ENC)")
 
-    # --- repair_semantics.c: KOUT array ---
+    # --- repair_semantics.c: KOUT_ENC array (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/repair_semantics.c")
-    kout_parts = [f"{v:#010x}u" for v in KOUT[:4]] + [f"{v:#010x}u" for v in KOUT[4:]]
-    new_kout = f"static volatile const uint32_t KOUT[8] = {{\n    {', '.join(kout_parts[:4])},\n    {', '.join(kout_parts[4:])}\n}};"
-    if update_file(src, r"static volatile const uint32_t KOUT\[8\] = \{[^;]+;", new_kout, multiline=True):
+    kout_enc = [xor_encrypt_u32(KOUT[i], cx_key, i * 4) for i in range(8)]
+    kout_parts_enc = [f"{v:#010x}u" for v in kout_enc[:4]] + [f"{v:#010x}u" for v in kout_enc[4:]]
+    new_kout = f"static volatile const uint32_t KOUT_ENC[8] = {{\n    {', '.join(kout_parts_enc[:4])},\n    {', '.join(kout_parts_enc[4:])}\n}};"
+    if update_file(src, r"static volatile const uint32_t KOUT_ENC\[8\] = \{[^;]+;", new_kout, multiline=True):
         changes += 1
-        log(f"  update repair_semantics.c (KOUT)")
+        log(f"  update repair_semantics.c (KOUT_ENC)")
 
-    # --- key_expand.c: EXPECTED_SOKEY_CHECK ---
+    # --- key_expand.c: EXPECTED_SOKEY_CHECK_ENC (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/key_expand.c")
-    pattern = r"EXPECTED_SOKEY_CHECK = 0x[0-9a-fA-F]+u;"
-    repl = f"EXPECTED_SOKEY_CHECK = {EXPECTED_SOKEY_CHECK:#010x}u;"
+    expected_enc = xor_encrypt_u32(EXPECTED_SOKEY_CHECK, cx_key, 0)
+    pattern = r"EXPECTED_SOKEY_CHECK_ENC = 0x[0-9a-fA-F]+u;"
+    repl = f"EXPECTED_SOKEY_CHECK_ENC = {expected_enc:#010x}u;"
     if update_file(src, pattern, repl, multiline=True):
         changes += 1
-        log(f"  update key_expand.c (EXPECTED_SOKEY_CHECK={EXPECTED_SOKEY_CHECK:#010x}u)")
+        log(f"  update key_expand.c (EXPECTED_SOKEY_CHECK_ENC={expected_enc:#010x}u)")
 
-    # --- jni_entry.c: both ENC_EXPECTED_STATE arrays + CRC comment ---
+    # --- jni_entry.c: ENC_EXPECTED_STATE_ENC arrays (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/jni_entry.c")
     with open(src, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Update CRC comment
+    # Update ENC_EXPECTED_STATE_ENC (scheme B, first)
     new_content = re.sub(
-        r"CRC=[0-9a-f]+\)",
-        f"CRC={crc:08x})",
-        content
-    )
-
-    # Update ENC_EXPECTED_STATE (scheme B) — volatile const
-    new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
+        r"(volatile const uint8_t ENC_EXPECTED_STATE_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
         lambda m: m.group(1) + "\n    " + enc_b_str + "\n" + m.group(2),
-        new_content, count=1
+        content, count=1
     )
 
-    # Update ENC_EXPECTED_STATE_A (scheme A fallback) — volatile const
+    # Update ENC_EXPECTED_STATE_A_ENC (scheme A)
     new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE_A\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
+        r"(volatile const uint8_t ENC_EXPECTED_STATE_A_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
         lambda m: m.group(1) + "\n    " + enc_a_str + "\n" + m.group(2),
         new_content, count=1
     )
 
-    # Update ENC_EXPECTED_STATE2 (scheme B second SPN) — volatile const
+    # Update ENC_EXPECTED_STATE2_ENC (scheme B, second)
     new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE2\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
+        r"(volatile const uint8_t ENC_EXPECTED_STATE2_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
         lambda m: m.group(1) + "\n    " + enc_b2_str + "\n" + m.group(2),
         new_content, count=1
     )
@@ -714,21 +1095,20 @@ def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc,
         with open(src, "w", encoding="utf-8") as f:
             f.write(new_content)
         changes += 1
-        log(f"  update jni_entry.c (CRC + ENC arrays)")
+        log(f"  update jni_entry.c (ENC arrays)")
 
-    # --- repair_sbox.c: SBOX_CHECK ---
-    # volatile 局部变量读取（sc0/sc1/sc2）阻止编译器内联立即数到 .text，
-    # 所以 SBOX_CHECK 值只影响 .rodata，不影响 .text CRC，无振荡风险。
+    # --- repair_sbox.c: SBOX_CHECK_ENC (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/repair_sbox.c")
+    sbc_enc = [sbox_check[i] ^ cx_key[i & 0xF] for i in range(3)]
     new_sbox_check = (
-        f"static volatile const uint8_t SBOX_CHECK[3] = "
-        f"{{{sbox_check[0]:#04x}, {sbox_check[1]:#04x}, {sbox_check[2]:#04x}}};  /* converge.py 填入 */"
+        f"static volatile const uint8_t SBOX_CHECK_ENC[3] = "
+        f"{{{sbc_enc[0]:#04x}, {sbc_enc[1]:#04x}, {sbc_enc[2]:#04x}}};"
     )
     if update_file(src,
-                   r"static volatile const uint8_t SBOX_CHECK\[3\] = \{[^;]+;[^\n]*",
+                   r"static volatile const uint8_t SBOX_CHECK_ENC\[3\] = \{[^;]+;",
                    new_sbox_check, multiline=True):
         changes += 1
-        log(f"  update repair_sbox.c (SBOX_CHECK={sbox_check.hex()})")
+        log(f"  update repair_sbox.c (SBOX_CHECK_ENC)")
 
     # --- repair_cfg.c: BB offsets (volatile const → .rodata) ---
     if bb_addrs:
@@ -885,7 +1265,8 @@ def main():
 
         changes = update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT,
                                    EXPECTED_SOKEY_CHECK, crc,
-                                   base64.b64encode(flag_a).decode(), sbox_check, bb_addrs)
+                                   base64.b64encode(flag_a).decode(), sbox_check, bb_addrs,
+                                   so_path)
         if changes == 0:
             log(f"  No file changes, converged")
             break
@@ -910,6 +1291,77 @@ def main():
     enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox)
     enc_b = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK)
     enc_b2 = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B)
+
+    # ── Oracle shellcode 后处理：patch data + XOR encrypt ──────
+    log("Patching oracle shellcode...")
+    # 计算正确的 oracle 数据: seeds[16] + material[0:16]
+    full_mat = expand_key_material(FLAG_B, 96)
+    oracle_seeds = full_mat[80:96]    # material[80:96] = seeds
+    oracle_mat16 = full_mat[0:16]     # material[0:16] = round_keys[0:4]
+    oracle_data = oracle_seeds + oracle_mat16  # 32 bytes total
+    log(f"  seeds = {oracle_seeds.hex()}")
+    log(f"  material[0:16] = {oracle_mat16.hex()}")
+
+    # Patch 32 bytes 到 .so（明文状态）
+    patch_oracle_material(so_path, oracle_data)
+    # XOR 加密整个 oracle shellcode 区间
+    encrypt_oracle_section(so_path, soKey)
+
+    # ── 重新打包 APK（直接修改 APK 中的 .so，绕过 gradle 缓存问题）──
+    log("Patching APK .so directly...")
+    apk_path = os.path.join(ROOT, "app/build/outputs/apk", BUILD_TYPE, f"app-{BUILD_TYPE}.apk")
+    import zipfile as _zf, shutil as _sh, tempfile as _tf
+
+    # 读取 patched merged .so（已含 oracle data + encryption）
+    with open(so_path, "rb") as f:
+        patched_so = f.read()
+
+    # Strip the patched .so ourselves using llvm-strip
+    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
+    strip_bin = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
+    if not os.path.isfile(strip_bin):
+        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
+            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
+            strip_bin = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
+            if os.path.isfile(strip_bin):
+                break
+
+    # Write patched .so to temp, strip it
+    tmp_so = os.path.join(ROOT, "app/build/tmp_patched_kctf.so")
+    with open(tmp_so, "wb") as f:
+        f.write(patched_so)
+    subprocess.run([strip_bin, "--strip-unneeded", tmp_so], check=True)
+    with open(tmp_so, "rb") as f:
+        stripped_patched = f.read()
+    os.remove(tmp_so)
+
+    # Replace .so inside APK zip
+    tmp_apk = apk_path + ".tmp"
+    with _zf.ZipFile(apk_path, 'r') as zin, _zf.ZipFile(tmp_apk, 'w') as zout:
+        for item in zin.infolist():
+            if item.filename == 'lib/arm64-v8a/libkctf.so':
+                zout.writestr(item, stripped_patched)
+            else:
+                zout.writestr(item, zin.read(item.filename))
+    os.replace(tmp_apk, apk_path)
+
+    # Re-sign APK (zip modification invalidates existing signature)
+    apksigner = None
+    sdk = os.path.expanduser("~/AppData/Local/Android/Sdk")
+    import glob as _glob2
+    candidates = _glob2.glob(os.path.join(sdk, "build-tools/*/apksigner.bat"))
+    if candidates:
+        apksigner = sorted(candidates)[-1]
+    ks = os.path.expanduser("~/.android/debug.keystore")
+    if apksigner and os.path.exists(ks):
+        subprocess.run([apksigner, "sign", "--ks", ks, "--ks-pass", "pass:android",
+                       "--ks-key-alias", "androiddebugkey", "--key-pass", "pass:android",
+                       apk_path], check=True, capture_output=True)
+        log(f"APK signed: {apk_path}")
+    else:
+        log(f"WARNING: apksigner not found, APK unsigned!")
+
+    log(f"APK patched: {apk_path} (oracle data injected)")
 
     b_pass, a_pass, _ = verify_python(so_path, soKey, EXPECTED_SOKEY_CHECK, enc_a, enc_b, enc_b2, bb_addrs)
 
