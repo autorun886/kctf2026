@@ -76,7 +76,7 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
 }
 
 /* soKey 双向验证常量（XOR 加密存储，converge.py 填入） */
-static volatile const uint32_t EXPECTED_SOKEY_CHECK_ENC = 0xb486524au;
+static volatile const uint32_t EXPECTED_SOKEY_CHECK_ENC = 0x73f79794u;
 
 /*
  * key_schedule — 从 flag + soKey 派生 runtime_params。

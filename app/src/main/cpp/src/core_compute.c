@@ -17,6 +17,13 @@ static const uint32_t IV_A[4] = {
     0xDEADBEEFu, 0xCAFEBABEu, 0x8BADF00Du, 0xFEEDFACEu
 };
 
+/* const_xor piece 1: IV_A[0] ^ (IV_A[2] ror 13) — 耦合到 const_xor.c */
+uint32_t cxk_get_piece1(void) {
+    uint32_t v = IV_A[2];
+    v = (v >> 13) | (v << 19);  /* ror 13 */
+    return IV_A[0] ^ v;
+}
+
 /* ── step2：循环左移（repair_semantics 修复 amount）────── */
 static inline uint32_t step2(uint32_t val, uint8_t amount) {
     amount &= 0x1Fu;

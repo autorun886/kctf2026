@@ -5,10 +5,11 @@ keygen.py — KCTF2026 自包含 Keygen（选手视角）
 解题路径：
   1. Java 层 deriveNativeKey → CRC32(.text) + LCG 扩展 → soKey
   2. jni_entry → 50 字节交错拆分，方案 A(偶数位) + 方案 B(奇数位)
-  3. key_expand.c → ARX 12 轮 Speck 变体 + EXPECTED_SOKEY_CHECK
-  4. seeds_oracle → 3-share Feistel 解密 shellcode → 提取 seeds[4] + material[0:16]
-  5. spn_round.c → 16 轮 SPN (SubBytes/ShiftRows/MixColumns/NL_Feedback/AddRoundKey)
-  6. 方案 A → repair 链逆向（cfg/sbox/constants/semantics 各步直接计算）
+  3. const_xor.c → 3 模块耦合派生 XOR key，解密 .rodata 中的 _ENC 常量
+  4. key_expand.c → ARX 12 轮 Speck 变体 + EXPECTED_SOKEY_CHECK
+  5. seeds_oracle → 3-share Feistel 解密 shellcode → 提取 seeds[4] + material[0:16]
+  6. spn_round.c → 16 轮 SPN (SubBytes/ShiftRows/MixColumns/NL_Feedback/AddRoundKey)
+  7. 方案 A → repair 链逆向（cfg/sbox/constants/semantics 各步直接计算）
 
 求解策略：
   方案 B：Z3 约束 ARX (material[0:16] + material[80:96]==seeds + sokey_check)
@@ -52,16 +53,19 @@ KNOWN_RK15 = 0xee6d3dd9
 # BB0_BRANCH_OFF, BB1_OFF, BB6_ADR_OFF, BB7_ENTRY_OFF
 # BB1 = BB0 + 4 (一条 B 指令), BB7 = BB6 + 8 (ADR + BR)
 BB_OFFSETS = {
-    'BB0_BRANCH_OFF': 0x467c,
-    'BB1_OFF':        0x4680,
-    'BB6_ADR_OFF':    0x48fc,
-    'BB7_ENTRY_OFF':  0x4904,
+    'BB0_BRANCH_OFF': 0x4870,
+    'BB1_OFF':        0x4874,
+    'BB4_BRANCH_OFF': 0x4a3c,
+    'DEAD_BLOCK_OFF': 0x4a40,
+    'BB5_OFF':        0x4a50,
+    'BB6_ADR_OFF':    0x4af0,
+    'BB7_ENTRY_OFF':  0x4af8,
 }
 
 # EXPECTED_SOKEY_CHECK: key_expand.c 中 volatile const (.rodata)
 # 选手从 IDA 中 key_schedule 函数的 LDR 交叉引用找到
 # check = round_keys[15] ^ soKey[12:16] 必须等于此值
-EXPECTED_SOKEY_CHECK = 0x8b90f03e
+EXPECTED_SOKEY_CHECK = 0xf151995c
 
 # ═══════════════════════════════════════════════════════════════
 # ELF 解析 & soKey 派生
@@ -301,16 +305,34 @@ def extract_oracle_data(so_bytes, sections, soKey):
 
 
 # ── Const XOR key (mirrors const_xor.c get_const_xor_key) ────────────
-def _compute_const_xor_key(so_bytes, sections):
+def _compute_const_xor_key(so_bytes=None, sections=None):
     """Compute 16-byte XOR key that encrypts .rodata constants.
     Matches const_xor.c: get_const_xor_key().
 
-    NOTE: const_xor is currently DISABLED (returns all-zero key) for device
-    compatibility — the self-referential CRC read of expand_key_material caused
-    SIGSEGV on some devices. .rodata constants are therefore stored in plaintext.
-    Keep this in sync with const_xor.c.
+    Key = LCG_expand(CRC32(KPT) ^ (IV_A[0] ^ ror13(IV_A[2])) ^ (LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4])))
+
+    选手需要逆向 const_xor.c 中的 get_const_xor_key 函数，
+    跟进 3 个 cxk_get_piece* 调用到各自的源文件。
     """
-    return bytes(16)
+    # Piece 0: CRC32 of KPT array (repair_constants.c)
+    kpt_raw = struct.pack('<6I', 0x00000001, 0x00000002, 0xdeadbeef, 0xcafebabe,
+                          0x12345678, 0x9abcdef0)
+    piece0 = zlib.crc32(kpt_raw) & 0xFFFFFFFF
+
+    # Piece 1: IV_A[0] ^ ror13(IV_A[2]) (core_compute.c)
+    iv_a2 = 0x8BADF00D
+    piece1 = 0xDEADBEEF ^ (((iv_a2 >> 13) | (iv_a2 << 19)) & 0xFFFFFFFF)
+
+    # Piece 2: LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4]) (jni_entry.c)
+    piece2 = 0x67452301 ^ 0x3CC35AA5
+
+    seed = piece0 ^ piece1 ^ piece2
+    key = bytearray(16)
+    s = seed
+    for i in range(4):
+        s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+        struct.pack_into('<I', key, i * 4, s)
+    return bytes(key)
 
 
 def _compute_const_xor_key_full(so_bytes, sections):
@@ -837,16 +859,16 @@ def verify_flag_b(flag_b, soKey, expected_check, target1, target2):
 KPT = [(0x00000001, 0x00000002),
        (0xDEADBEEF, 0xCAFEBABE),
        (0x12345678, 0x9ABCDEF0)]
-KCT = [(0x7678860b, 0xa4382c47),
-       (0x97ba2eab, 0xbffb1149),
-       (0x73e1b82f, 0x34b86f03)]
+KCT = [(0xe5d19cc5, 0xebc82f84),
+       (0x15fb5f6b, 0xf1580b7f),
+       (0xa6170749, 0x86e70ddf)]
 # repair_semantics.c: KIN/KOUT（KIN 是 static const，KOUT 是 volatile const）
 KIN  = [0x00000001, 0x12345678, 0xdeadbeef, 0xcafebabe,
         0x8badf00d, 0xfeedface, 0x01234567, 0x89abcdef]
-KOUT = [0x0089b100, 0xf1c20e18, 0x40686b99, 0xa60c2c31,
-        0x9639171a, 0xe56a938b, 0x8e9f4589, 0xacb1af8b]
+KOUT = [0x1b886100, 0xdcc4be18, 0xad66db99, 0xcd0e7c31,
+        0xf33b471a, 0x0e64c38c, 0xab98f589, 0xc9af1f8b]
 # repair_sbox.c: SBOX_CHECK（volatile const）
-SBOX_CHECK = [0x81, 0xfe, 0xac]
+SBOX_CHECK = [0xee, 0xd3, 0xc3]
 
 
 def _read_rodata_bb_offsets(so_bytes, sections):
@@ -1027,7 +1049,7 @@ def solve_scheme_a(so_bytes, sections, soKey):
     求解步骤：
       1. flag[0:4]  = (BB1 - BB0) / 4  (直接算)
       2. flag[4]    = 0x01              (repair_cfg 硬检查)
-      3. flag[5:9]  = 任意非零          (repair_cfg 只检查 != 0)
+      3. flag[5:9]  = ((BB5-DEAD)/4 ^ (DEAD-BB4)/4) ^ soKey[8:12]  (全32位绑定)
       4. flag[9:13] = soKey[0:4] ^ ADR_encode(BB7-BB6)
       5. flag[9:13] → sbox → sbox_first
       6. flag[13:17] = 0x9E3779B9 (标准 XTEA delta，KPT/KCT 验证)
@@ -1060,8 +1082,15 @@ def solve_scheme_a(so_bytes, sections, soKey):
     # ── 3. flag[4]: TBZ bit field ──
     flag_a[4] = 0x01
 
-    # ── 4. flag[5:9]: 非零即可 ──
-    struct.pack_into('<I', flag_a, 5, 0x00000001)
+    # ── 4. flag[5:9]: (BB5-DEAD)/4 ^ (DEAD-BB4)/4 ^ soKey[8:12] ──
+    # repair_cfg: flag[5:9] ^ soKey[8:12] == expected
+    # 选手需追踪 .rodata 中 BB4/DEAD/BB5 三个 volatile const
+    BB4 = bb_addrs.get('BB4_BRANCH_OFF', BB0 + 0x1cc)
+    DEAD = bb_addrs.get('DEAD_BLOCK_OFF', BB4 + 4)
+    BB5 = bb_addrs.get('BB5_OFF', DEAD + 16)
+    expected_b4 = ((BB5 - DEAD) // 4) ^ ((DEAD - BB4) // 4)
+    sokey_8_11 = struct.unpack_from('<I', soKey, 8)[0]
+    struct.pack_into('<I', flag_a, 5, (expected_b4 ^ sokey_8_11) & 0xFFFFFFFF)
 
     # ── 5. flag[9:13]: ADR encoding 约束 ──
     # repair_cfg: (flag[9:13] ^ soKey[0:4]) & imm_mask == expected_adr_bits

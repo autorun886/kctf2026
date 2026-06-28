@@ -8,6 +8,23 @@ extern uint8_t  sbox_shipped[256];
 extern uint32_t round_constants[32];
 extern uint32_t xtea_delta;
 
+/* const_xor piece 0: CRC32 of KPT (24 bytes LE) — 耦合到 const_xor.c
+ * 选手需要识别这里用的是同一组 KPT 做 CRC32 来生成解密密钥的一部分 */
+uint32_t cxk_get_piece0(void) {
+    static const uint32_t kpt_raw[6] = {
+        0x00000001u, 0x00000002u, 0xdeadbeefu, 0xcafebabeu,
+        0x12345678u, 0x9abcdef0u
+    };
+    uint32_t crc = 0xFFFFFFFFu;
+    const uint8_t *p = (const uint8_t *)kpt_raw;
+    for (int i = 0; i < 24; i++) {
+        crc ^= p[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 /* 3 组已知明密文对（xtea_check_encrypt 验证 xtea_delta + round_constants） */
 static const uint32_t KPT[3][2] = {
     {0x00000001u, 0x00000002u},
@@ -16,9 +33,9 @@ static const uint32_t KPT[3][2] = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
 static volatile const uint32_t KCT_ENC[3][2] = {
-    {0x7678860bu, 0xa4382c47u},
-    {0x97ba2eabu, 0xbffb1149u},
-    {0x73e1b82fu, 0x34b86f03u}
+    {0x6777920du, 0x91814c03u},
+    {0x72049451u, 0xb9576a2eu},
+    {0x24b10981u, 0xfcae6e58u}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */

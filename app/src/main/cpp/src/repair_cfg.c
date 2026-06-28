@@ -10,10 +10,13 @@ extern uint32_t xtea_delta;
 /* ── 合法 BB 入口偏移表（converge.py 自动填入）──────── */
 /* ── BB 偏移（相对 .text 起始，converge.py 自动填入）── */
 /* volatile const → .rodata，不影响 .text CRC */
-static volatile const uint32_t BB0_BRANCH_OFF = 0x467cu;
-static volatile const uint32_t BB1_OFF        = 0x4680u;
-static volatile const uint32_t BB6_ADR_OFF_V  = 0x48fcu;
-static volatile const uint32_t BB7_ENTRY_OFF  = 0x4904u;
+static volatile const uint32_t BB0_BRANCH_OFF = 0x4870u;
+static volatile const uint32_t BB1_OFF        = 0x4874u;
+static volatile const uint32_t BB6_ADR_OFF_V  = 0x4af0u;
+static volatile const uint32_t BB7_ENTRY_OFF  = 0x4af8u;
+static volatile const uint32_t BB4_BRANCH_OFF = 0x4a3cu;
+static volatile const uint32_t BB5_OFF        = 0x4a50u;
+static volatile const uint32_t DEAD_BLOCK_OFF = 0x4a40u;
 
 /* dispatch table（BB6→BB7 间接跳转，验证用） */
 uint32_t dispatch_table[4] = {0,0,0,0};
@@ -52,11 +55,13 @@ void repair_cfg(const uint8_t *flag, const uint8_t *so_key) {
     if ((flag[4] & 0x0Fu) != 0x01u)
         goto honeypot_sbox;
 
-    /* ── 3. 验证 flag[5:9]：BB4→BB5 跳转偏移 ──────────── */
-    /* 这里验证 flag[5:9] 编码了正确的 dead block 跳过偏移 */
-    uint32_t flag_b4 = (*(const uint32_t *)(flag + 5)) & 0x03FFFFFFu;
-    /* 正确值由 converge.py 计算并编码到 flag 中，这里只验证非零 */
-    if (flag_b4 == 0) goto honeypot_sbox;
+    /* ── 3. 验证 flag[5:9]：BB4→BB5 跳转偏移（与 soKey[8:12] 绑定）── */
+    /* flag[5:9] ^ soKey[8:12] 必须等于 (BB5-DEAD)/4 ^ (DEAD-BB4)/4
+     * 选手需追踪 EOR + .rodata 交叉引用 */
+    uint32_t flag_b4 = *(const uint32_t *)(flag + 5) ^ *(const uint32_t *)(so_key + 8);
+    uint32_t expected_b4 = ((BB5_OFF - DEAD_BLOCK_OFF) / 4u)
+                         ^ ((DEAD_BLOCK_OFF - BB4_BRANCH_OFF) / 4u);
+    if (flag_b4 != expected_b4) goto honeypot_sbox;
 
     /* ── 4. 验证 flag[9:13]：BB6 adr imm21（与 soKey 联合）── */
     uint32_t adr_key = *(const uint32_t *)(flag + 9) ^ *(const uint32_t *)so_key;

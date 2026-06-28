@@ -280,9 +280,33 @@ def _const_share0_second():
         L = tmp
     return struct.pack('<II', L, R)
 
-def compute_const_xor_key(so_path, soKey=None):
-    """Returns zero key (const_xor disabled for compatibility)"""
-    return bytes(16)
+def compute_const_xor_key(so_path=None, soKey=None):
+    """Compute const_xor key matching C code in const_xor.c.
+    Key = LCG_expand(CRC32(KPT) ^ (IV_A[0] ^ ror13(IV_A[2])) ^ (LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4])))
+    All inputs are fixed constants — no dependency on .so or soKey."""
+    import zlib as _zlib
+
+    # Piece 0: CRC32 of KPT (24 bytes LE)
+    kpt_raw = struct.pack('<6I', 0x00000001, 0x00000002, 0xdeadbeef, 0xcafebabe,
+                          0x12345678, 0x9abcdef0)
+    piece0 = _zlib.crc32(kpt_raw) & 0xFFFFFFFF
+
+    # Piece 1: IV_A[0] ^ ror13(IV_A[2])
+    iv_a2 = 0x8BADF00D
+    piece1 = 0xDEADBEEF ^ (((iv_a2 >> 13) | (iv_a2 << 19)) & 0xFFFFFFFF)
+
+    # Piece 2: LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4])
+    # IV  = [0x01,0x23,0x45,0x67,...] → LE u32 = 0x67452301
+    # IV2 = [0xA5,0x5A,0xC3,0x3C,...] → LE u32 = 0x3CC35AA5
+    piece2 = 0x67452301 ^ 0x3CC35AA5
+
+    seed = piece0 ^ piece1 ^ piece2
+    key = bytearray(16)
+    s = seed
+    for i in range(4):
+        s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+        struct.pack_into('<I', key, i * 4, s)
+    return bytes(key)
 
 # ── Helper: XOR encrypt a value with the const key ──────────────────
 def xor_encrypt_u32(value, key, offset):
@@ -960,10 +984,16 @@ def build_flag(soKey, bb_addrs):
     # flag[4] = TBZ bit field XOR (set to 1 to test bit 1 not 0)
     flag[4] = 0x01
 
-    # flag[5:9] = BB4 B imm26 → point to BB5 not dead block
-    dead_imm26 = ((DEAD_OFF - BB4_BRANCH_OFF) // 4) & 0x03FFFFFF if BB4_BRANCH_OFF else 1
-    bb5_correct = ((bb_addrs.get("BB5_OFF", DEAD_OFF + 16) - BB4_BRANCH_OFF) // 4) & 0x03FFFFFF if BB4_BRANCH_OFF else 0x10
-    flag_5_8 = (bb5_correct ^ dead_imm26) & 0x03FFFFFF
+    # flag[5:9] ^ soKey[8:12] == (BB5-DEAD)/4 ^ (DEAD-BB4)/4
+    DEAD_OFF = bb_addrs.get("DEAD_BLOCK_OFF", 0)
+    BB4_BRANCH_OFF = bb_addrs.get("BB4_BRANCH_OFF", 0)
+    BB5_OFF_V = bb_addrs.get("BB5_OFF", DEAD_OFF + 16)
+    if BB4_BRANCH_OFF and DEAD_OFF:
+        expected_b4 = ((BB5_OFF_V - DEAD_OFF) // 4) ^ ((DEAD_OFF - BB4_BRANCH_OFF) // 4)
+    else:
+        expected_b4 = 5  # fallback
+    sokey_8_11 = struct.unpack_from("<I", soKey, 8)[0]
+    flag_5_8 = (expected_b4 ^ sokey_8_11) & 0xFFFFFFFF
     struct.pack_into("<I", flag, 5, flag_5_8)
 
     # flag[9:13] = ADR imm21 XOR key with soKey[0:4]
@@ -1021,8 +1051,8 @@ def fmt_hex_row(data):
 
 def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc, flag_b64_a, sbox_check, bb_addrs=None, so_path=None):
     """Write all computed constants back to source files (XOR-encrypted)."""
-    # Compute XOR key for constant protection
-    cx_key = compute_const_xor_key(so_path) if so_path else (b'\x00' * 16)
+    # Compute XOR key for constant protection (fixed derivation, no .so dependency)
+    cx_key = compute_const_xor_key()
 
     enc_a_enc = xor_encrypt_bytes(enc_a, cx_key)
     enc_b_enc = xor_encrypt_bytes(enc_b, cx_key)
@@ -1131,6 +1161,18 @@ def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc,
         new_content = re.sub(
             r"static volatile const uint32_t BB7_ENTRY_OFF\s+= 0x[0-9a-fA-F]+u;",
             f"static volatile const uint32_t BB7_ENTRY_OFF  = 0x{bb7:04x}u;", new_content)
+        bb4 = bb_addrs.get("BB4_BRANCH_OFF", 0)
+        bb5 = bb_addrs.get("BB5_OFF", 0)
+        dead = bb_addrs.get("DEAD_BLOCK_OFF", 0)
+        new_content = re.sub(
+            r"static volatile const uint32_t BB4_BRANCH_OFF = 0x[0-9a-fA-F]+u;",
+            f"static volatile const uint32_t BB4_BRANCH_OFF = 0x{bb4:04x}u;", new_content)
+        new_content = re.sub(
+            r"static volatile const uint32_t BB5_OFF\s+= 0x[0-9a-fA-F]+u;",
+            f"static volatile const uint32_t BB5_OFF        = 0x{bb5:04x}u;", new_content)
+        new_content = re.sub(
+            r"static volatile const uint32_t DEAD_BLOCK_OFF = 0x[0-9a-fA-F]+u;",
+            f"static volatile const uint32_t DEAD_BLOCK_OFF = 0x{dead:04x}u;", new_content)
         if new_content != content:
             with open(src, "w", encoding="utf-8") as f:
                 f.write(new_content)
@@ -1245,8 +1287,13 @@ def main():
         flag_a = build_flag(soKey, bb_addrs)
         flag_b = FLAG_B
 
-        KCT, KOUT, rc, sbox, step3_bits, EXPECTED_SOKEY_CHECK = \
+        KCT, KOUT, rc, sbox, step3_bits, _ = \
             compute_kct_kout(flag_a, soKey, bb_addrs)
+        # EXPECTED_SOKEY_CHECK 必须从 flag_b 计算（key_schedule 在 verify_scheme_b 中调用）
+        mat_b = expand_key_material(flag_b, 96)
+        rk15_b = struct.unpack_from("<I", mat_b, 60)[0]
+        sokey_12 = struct.unpack_from("<I", soKey, 12)[0]
+        EXPECTED_SOKEY_CHECK = rk15_b ^ sokey_12
         log(f"  step3_bits = {step3_bits}")
         log(f"  SOKEY_CHECK = {EXPECTED_SOKEY_CHECK:#010x}")
 
@@ -1287,7 +1334,12 @@ def main():
     bb_addrs = extract_bb_addrs(elf_data, text_foff, text_vaddr, text_size, so_path)
     flag_a = build_flag(soKey, bb_addrs)
 
-    _, _, rc, sbox, _, EXPECTED_SOKEY_CHECK = compute_kct_kout(flag_a, soKey, bb_addrs)
+    _, _, rc, sbox, _, _ = compute_kct_kout(flag_a, soKey, bb_addrs)
+    # EXPECTED_SOKEY_CHECK from flag_b (matches key_schedule in verify_scheme_b)
+    mat_b = expand_key_material(FLAG_B, 96)
+    rk15_b = struct.unpack_from("<I", mat_b, 60)[0]
+    sokey_12 = struct.unpack_from("<I", soKey, 12)[0]
+    EXPECTED_SOKEY_CHECK = rk15_b ^ sokey_12
     enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox)
     enc_b = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK)
     enc_b2 = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B)

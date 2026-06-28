@@ -98,6 +98,25 @@ seeds_raw = dec[-32:-16]       # 16 bytes → struct.unpack('<4I') 得到 4 个 
 material_0_16 = dec[-16:]      # 16 bytes，Z3 约束用
 ```
 
+### .rodata 常量解密（const_xor）
+
+.rodata 中带 `_ENC` 后缀的常量（KCT、KOUT、SBOX_CHECK、EXPECTED_SOKEY_CHECK 等）都经过 XOR 加密。跟进 `get_const_xor_key()` 发现它调用了 3 个外部函数拼凑 seed：
+
+```python
+piece0 = CRC32(KPT_array)                # repair_constants.c 中 3 组明文对的 CRC32
+piece1 = IV_A[0] ^ ror32(IV_A[2], 13)    # core_compute.c 中的 Feistel IV
+piece2 = u32_le(IV[0:4]) ^ u32_le(IV2[0:4])  # jni_entry.c 中两组 SPN IV
+
+seed = piece0 ^ piece1 ^ piece2
+key = bytearray(16)
+s = seed
+for i in range(4):
+    s = (s * 1664525 + 1013904223) & 0xFFFFFFFF  # 同 round_constants 的 LCG
+    key[i*4:i*4+4] = struct.pack('<I', s)
+```
+
+用这个 key XOR 解密所有 `_ENC` 值后才能得到真正的验证目标。
+
 ### Z3 求解
 
 已知 288 bits 约束（> 200 bits 输入 → 唯一解）：
@@ -149,7 +168,13 @@ flag[0:4] & 0x03FFFFFF == (BB1_OFF - BB0_BRANCH_OFF) / 4
 
 ### flag[5:9]
 
-只检查非零，填 `0x00000001`。
+`repair_cfg` 中 `flag[5:9] ^ soKey[8:12]` 与一个计算值比较。追踪 IDA 中的 EOR 和 LDR 引用：
+
+```python
+# 从 .rodata 读取 BB4_BRANCH_OFF, DEAD_BLOCK_OFF, BB5_OFF
+expected = ((BB5_OFF - DEAD_BLOCK_OFF) // 4) ^ ((DEAD_BLOCK_OFF - BB4_BRANCH_OFF) // 4)
+flag_5_9 = struct.pack('<I', expected ^ struct.unpack('<I', soKey[8:12])[0])
+```
 
 ### flag[9:13]：ADR 编码
 
@@ -202,7 +227,7 @@ for i in range(25):
 print(flag50.hex())
 ```
 
-**Flag**: `017a00e3001b009401d2045600f8000c0041ebb7dd290b8e1463b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
+**Flag**: `017a00e3001b009401d25256aff88c0c2a41d4b792295a8e4a63b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
 
 ## 0x06 踩坑
 

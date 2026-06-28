@@ -10,7 +10,7 @@ Android ARM64 逆向挑战。APK 中包含 `libkctf.so`，输入为 50 字节 he
 
 两方案均需 PASS，最终 flag 为 50 字节交错结果的 hex 表示。
 
-**最终 Flag**：`017a00e3001b009401d2045600f8000c0041ebb7dd290b8e1463b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
+**最终 Flag**：`017a00e3001b009401d25256aff88c0c2a41d4b792295a8e4a63b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
 
 **状态**：✅ 已在真机验证通过（Pixel 6 Pro, Android 15）
 
@@ -44,7 +44,19 @@ for i in range(4):
 ### 2.2 .rodata 关键常量
 
 当前版本 .rodata 中的验证常量经过 `const_xor` 层加密存储（变量名带 `_ENC` 后缀）。
-由于 `get_const_xor_key()` 当前返回全零，加密等于不加密，IDA 中可直接读取。
+`get_const_xor_key()` 从 3 个模块的固定常量派生 16 字节 XOR 密钥：
+
+```python
+# const_xor.c: get_const_xor_key() 调用 3 个分散函数
+piece0 = CRC32(KPT_array)                # repair_constants.c: cxk_get_piece0()
+piece1 = IV_A[0] ^ ror32(IV_A[2], 13)    # core_compute.c:     cxk_get_piece1()
+piece2 = LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4])  # jni_entry.c:  cxk_get_piece2()
+seed = piece0 ^ piece1 ^ piece2
+key = LCG_expand(seed, mul=1664525, inc=1013904223)  # 同 round_constants 的 LCG
+```
+
+选手需逆向 `get_const_xor_key` 并跟进 3 个 `cxk_get_piece*` 外部调用，
+解密后才能获得 KCT/KOUT/SBOX_CHECK/EXPECTED_SOKEY_CHECK 等明文值。
 
 | 符号 | 大小 | 用途 |
 |------|------|------|
@@ -129,8 +141,8 @@ material[96:112] → material[0:16] ^ soKey[0:16]  (soKey 混入)
 delta            → *(uint32*)(material+96)  (即 material[0:4] ^ soKey[0:4])
 ```
 
-**soKey 校验**：`round_keys[15] ^ soKey[12:16]` == `EXPECTED_SOKEY_CHECK_ENC`，
-不匹配则 `delta ^= 0xDEADBEEF`（毒化，SPN 输出错误）。
+**soKey 校验**：`round_keys[15] ^ soKey[12:16]` == `EXPECTED_SOKEY_CHECK`（const_xor 解密后），
+匹配则 delta 不受影响；不匹配则 `delta ^= 0xDEADBEEF`（毒化，SPN 输出错误）。
 
 ### 3.3 Z3 约束建模
 
@@ -188,7 +200,7 @@ Z3 解出 flag_B 后，正向模拟验证：
 |------|------|---------|
 | flag[0:4] | BB0→BB1 跳转偏移 | `(BB1_OFF - BB0_BRANCH_OFF) / 4`，直接从 .rodata 读 BB 偏移计算 |
 | flag[4] | TBZ bit 字段 | 固定 `0x01`（repair_cfg 硬编码检查 `(flag[4] & 0x0F) == 0x01`） |
-| flag[5:9] | BB4→BB5 偏移 | 任意非零值即可（repair_cfg 仅检查 `!= 0`） |
+| flag[5:9] | BB4→BB5 偏移 ^ soKey[8:12] | `((BB5-DEAD)/4 ^ (DEAD-BB4)/4) ^ soKey[8:12]`，选手需从 .rodata 追踪 BB4/DEAD/BB5 三个 volatile const |
 | flag[9:13] | dispatch table key | `soKey[0:4] ^ ADR_encode(BB7-BB6)`，ADR encoding: immlo=imm21[1:0]<<29, immhi=imm21[20:2]<<5 |
 
 ### 4.2 repair_constants — flag[13:21]
