@@ -33,9 +33,9 @@ static const uint32_t KPT[3][2] = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
 static volatile const uint32_t KCT_ENC[3][2] = {
-    {0x6777920du, 0x91814c03u},
-    {0x72049451u, 0xb9576a2eu},
-    {0x24b10981u, 0xfcae6e58u}
+    {0x2ca35fcfu, 0x0e4c1ca9u},
+    {0xab03a410u, 0x7d271da1u},
+    {0x93904853u, 0x8305292bu}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */

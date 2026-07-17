@@ -45,6 +45,10 @@ void repair_semantics(const uint8_t *flag, uint8_t rc_high4);
 
 /* ── 共享工具 ─────────────────────────────────────────── */
 void get_ipc_material(uint8_t out[16]);
+void secure_bzero(void *ptr, size_t len);
+uint32_t kctf_crc32(const uint8_t *data, size_t len);
+uint32_t kctf_runtime_text_crc(uint32_t text_off, uint32_t text_size);
+uint32_t kctf_guard_anchor(void);
 void *get_func(const char *name);
 void *get_func_by_id(int id);   /* 0=clock_gettime 1=fopen 2=fgets 3=fclose
                                     4=open 5=read 6=close 7=mprotect */

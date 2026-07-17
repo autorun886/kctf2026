@@ -286,7 +286,7 @@ int get_oracle_material(uint8_t out[32]) {
     size_t alloc_size = (code_size + page_size - 1) & ~(page_size - 1);
 
     void *mem = mmap(NULL, alloc_size,
-                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED)
         return -1;
@@ -304,12 +304,23 @@ int get_oracle_material(uint8_t out[32]) {
     /* 清除指令缓存 */
     __builtin___clear_cache(mem, (char *)mem + code_size);
 
+    typedef int (*fn_mprotect)(void *, size_t, int);
+    fn_mprotect p_mprotect = (fn_mprotect)get_func_by_id(7);
+    if (!p_mprotect || p_mprotect(mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
+        secure_bzero(key, sizeof(key));
+        secure_bzero(mem, alloc_size);
+        munmap(mem, alloc_size);
+        return -1;
+    }
+
     /* 执行 shellcode */
     oracle_fn_t fn = (oracle_fn_t)mem;
     int ret = fn(out);
 
     /* 清零 + 释放 */
-    memset(mem, 0, alloc_size);
+    int can_wipe = (p_mprotect(mem, alloc_size, PROT_READ | PROT_WRITE) == 0);
+    secure_bzero(key, sizeof(key));
+    if (can_wipe) secure_bzero(mem, alloc_size);
     munmap(mem, alloc_size);
 
     return ret;

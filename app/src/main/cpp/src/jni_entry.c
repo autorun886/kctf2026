@@ -12,8 +12,8 @@ static volatile const uint8_t IV[STATE_LEN] = {
 
 /* 方案 B 第一次 SPN 目标（XOR 加密存储，converge.py 填入） */
 static volatile const uint8_t ENC_EXPECTED_STATE_ENC[STATE_LEN] = {
-    0xAE, 0xA6, 0xCC, 0x8F, 0x7E, 0x93, 0x70, 0x35,
-    0xC6, 0x54, 0x92, 0x9B, 0x44, 0x7F, 0xAA, 0xC0
+    0x19, 0x9E, 0x5B, 0xB3, 0x69, 0x80, 0xD4, 0x56,
+    0x7A, 0xA4, 0xC8, 0x8C, 0x52, 0xD9, 0x95, 0x47
 };
 
 /* ── 第二 IV（唯一性约束，与 IV1 不同）──────────────────── */
@@ -24,8 +24,8 @@ static volatile const uint8_t IV2[STATE_LEN] = {
 
 /* 方案 B 第二次 SPN 目标（XOR 加密存储，converge.py 填入） */
 static volatile const uint8_t ENC_EXPECTED_STATE2_ENC[STATE_LEN] = {
-    0x8B, 0xD3, 0xE0, 0xAB, 0x72, 0x29, 0x79, 0x98,
-    0x5E, 0xCA, 0x54, 0xD4, 0xF5, 0xA1, 0xFF, 0x4B
+    0x82, 0x85, 0xD0, 0x2D, 0x47, 0x35, 0xE9, 0x14,
+    0xB7, 0xC7, 0x41, 0x0E, 0xBB, 0x6A, 0xDD, 0xE9
 };
 
 /* const_xor piece 2: LE_u32(IV[0:4]) ^ LE_u32(IV2[0:4]) — 耦合到 const_xor.c */
@@ -39,17 +39,49 @@ uint32_t cxk_get_piece2(void) {
 
 /* 方案 A 目标状态（XOR 加密存储，converge.py 填入） */
 static volatile const uint8_t ENC_EXPECTED_STATE_A_ENC[STATE_LEN] = {
-    0x84, 0x70, 0xBA, 0xBC, 0xD7, 0xE0, 0xF0, 0xD9,
-    0x25, 0x81, 0x6A, 0x3E, 0x56, 0xE9, 0xA4, 0xD3
+    0x99, 0x30, 0x01, 0x33, 0xCA, 0x3A, 0xF3, 0x1E,
+    0x5A, 0x00, 0xA6, 0x91, 0x30, 0x40, 0x43, 0x54
 };
+
+static uint32_t load_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint8_t sokey_share_mask(int i) {
+    return (uint8_t)(((0x6Du + (uint32_t)i * 0x3Bu) ^ ((uint32_t)i * 0x1Du)) & 0xFFu);
+}
 
 /* ── JNI 回调获取 soKey ──────────────────────────────────── */
 static void fetch_sokey(JNIEnv *env, jobject obj, uint8_t out[SOKEY_LEN]) {
+    (void)kctf_guard_anchor();
     jclass    clazz = (*env)->GetObjectClass(env, obj);
     jmethodID mid   = (*env)->GetMethodID(env, clazz, "deriveNativeKey", "()[B");
     jbyteArray jarr = (jbyteArray)(*env)->CallObjectMethod(env, obj, mid);
-    (*env)->GetByteArrayRegion(env, jarr, 0, SOKEY_LEN, (jbyte *)out);
-    (*env)->DeleteLocalRef(env, jarr);
+    uint8_t meta[28] = {0};
+    jsize len = jarr ? (*env)->GetArrayLength(env, jarr) : 0;
+    jsize copy_len = (len < (jsize)sizeof(meta)) ? len : (jsize)sizeof(meta);
+    if (copy_len > 0)
+        (*env)->GetByteArrayRegion(env, jarr, 0, copy_len, (jbyte *)meta);
+    memcpy(out, meta, SOKEY_LEN);
+    for (int i = 0; i < SOKEY_LEN; i++)
+        out[i] ^= sokey_share_mask(i);
+
+    if (len >= 28) {
+        uint32_t apk_crc  = load_le32(meta + 16);
+        uint32_t text_off = load_le32(meta + 20);
+        uint32_t text_len = load_le32(meta + 24);
+        uint32_t mem_crc  = kctf_runtime_text_crc(text_off, text_len);
+        uint32_t diff = apk_crc ^ mem_crc;
+        uint32_t poison = ((diff | (~diff + 1u)) >> 31) * 0x9E3779B9u;
+        for (int i = 0; i < SOKEY_LEN; i++)
+            out[i] ^= (uint8_t)(poison >> ((i & 3) * 8));
+    } else {
+        for (int i = 0; i < SOKEY_LEN; i++)
+            out[i] ^= (uint8_t)(0xA5u + i * 17u);
+    }
+    secure_bzero(meta, sizeof(meta));
+    if (jarr) (*env)->DeleteLocalRef(env, jarr);
     (*env)->DeleteLocalRef(env, clazz);
 }
 
@@ -91,6 +123,9 @@ static int verify_scheme_a(const uint8_t *flagA, const uint8_t *soKey) {
     for (int i = 0; i < STATE_LEN; i++)
         diff |= final_state[i] ^ expected[i];
 
+    secure_bzero(final_state, sizeof(final_state));
+    secure_bzero(expected, sizeof(expected));
+    secure_bzero(state32, sizeof(state32));
     return (diff == 0) ? 1 : 0;
 }
 
@@ -148,33 +183,36 @@ static int verify_scheme_b(const uint8_t *flagB, const uint8_t *soKey) {
     struct runtime_params params;
     key_schedule(flagB, soKey, &params);
 
-    /* Oracle 比对：shellcode 返回 seeds[16] + material[0:16]
-     * 选手通过逆向 shellcode 得到这 32 字节构建 Z3 约束 */
+    /* Oracle 比对：shellcode 返回 seeds[16] + material[0:8] + tag[8].
+     * 不暴露完整 material[0:16]，避免直接补齐 ARX 末态后逆回 flag。 */
     extern volatile uint8_t g_sokey_for_oracle[16];
     for (int i = 0; i < 16; i++)
         g_sokey_for_oracle[i] = soKey[i];
 
-    uint8_t oracle_data[32];
-    if (get_oracle_material(oracle_data) != 0)
-        return 0;
+    uint8_t oracle_data[32] = {0};
+    int oracle_status = get_oracle_material(oracle_data);
 
-    /* oracle_data[0:16] = seeds, oracle_data[16:32] = material[0:16] */
+    /* oracle_data[0:16] = seeds, oracle_data[16:24] = material[0:8],
+     * oracle_data[24:32] = tag(seeds, soKey). */
     /* 验证 seeds */
     volatile uint8_t seeds_diff = 0;
     uint8_t *expected_seeds = (uint8_t *)params.sbox_seeds;
     for (int i = 0; i < 16; i++)
         seeds_diff |= expected_seeds[i] ^ oracle_data[i];
-    if (seeds_diff != 0)
-        return 0;
 
-    /* 验证 material[0:16] */
+    /* 验证 material[0:8]。后 8 字节不暴露，保留约束求解门槛。 */
     uint8_t material_head[16];
     expand_key_material(flagB, material_head, 16);
     volatile uint8_t mat_diff = 0;
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < 8; i++)
         mat_diff |= material_head[i] ^ oracle_data[16 + i];
-    if (mat_diff != 0)
-        return 0;
+
+    volatile uint8_t tag_diff = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t tag = (uint8_t)(oracle_data[i] ^ oracle_data[8 + i] ^
+                                soKey[(i + 5) & 0x0F] ^ (uint8_t)(0xC3u + i * 0x29u));
+        tag_diff |= tag ^ oracle_data[24 + i];
+    }
 
     uint8_t sboxes[SPN_SBOXES][256];
     for (int i = 0; i < SPN_SBOXES; i++)
@@ -208,7 +246,19 @@ static int verify_scheme_b(const uint8_t *flagB, const uint8_t *soKey) {
     for (int i = 0; i < STATE_LEN; i++)
         diff2 |= state2[i] ^ expected2[i];
 
-    return (diff == 0 && diff2 == 0) ? 1 : 0;
+    uint8_t oracle_diff = (uint8_t)((oracle_status != 0) ? 0xFFu : 0u);
+    uint8_t ok = (uint8_t)(diff | diff2 | seeds_diff | mat_diff | tag_diff | oracle_diff);
+
+    secure_bzero(&params, sizeof(params));
+    secure_bzero(oracle_data, sizeof(oracle_data));
+    secure_bzero(material_head, sizeof(material_head));
+    secure_bzero(sboxes, sizeof(sboxes));
+    secure_bzero(state, sizeof(state));
+    secure_bzero(expected, sizeof(expected));
+    secure_bzero(state2, sizeof(state2));
+    secure_bzero(expected2, sizeof(expected2));
+
+    return (ok == 0) ? 1 : 0;
 }
 
 /*
@@ -245,11 +295,14 @@ Java_com_autorun_kctf_MainActivity_nativeProcessInput(
     uint8_t soKey[SOKEY_LEN];
     fetch_sokey(env, obj, soKey);
 
-    /* 4. 方案 A（顺序依赖：必须先通过）*/
-    if (!verify_scheme_a(flagA, soKey)) return 0;
+    /* 4. 两个方案都执行，避免 coverage trace 直接观察阶段进度 */
+    int okA = verify_scheme_a(flagA, soKey);
+    int okB = verify_scheme_b(flagB, soKey);
+    int result = (okA & okB) ? 1 : 0;
 
-    /* 5. 方案 B */
-    if (!verify_scheme_b(flagB, soKey)) return 0;
-
-    return 1;
+    secure_bzero(input, sizeof(input));
+    secure_bzero(flagA, sizeof(flagA));
+    secure_bzero(flagB, sizeof(flagB));
+    secure_bzero(soKey, sizeof(soKey));
+    return result;
 }

@@ -76,19 +76,42 @@ def expand_key_material(flag_bytes, out_len=96):
         s[2] = rol64(s[2], 17); s[3] = ror64(s[3], 11)
     return bytes(out)
 
+def const_xor_key():
+    kpt_raw = struct.pack('<6I', 0x00000001, 0x00000002, 0xdeadbeef, 0xcafebabe,
+                          0x12345678, 0x9abcdef0)
+    piece0 = zlib.crc32(kpt_raw) & 0xFFFFFFFF
+    iv_a2 = 0x8BADF00D
+    piece1 = 0xDEADBEEF ^ (((iv_a2 >> 13) | (iv_a2 << 19)) & 0xFFFFFFFF)
+    piece2 = 0x67452301 ^ 0x3CC35AA5
+    seed = piece0 ^ piece1 ^ piece2
+    key = bytearray(16)
+    s = seed
+    for i in range(4):
+        s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+        struct.pack_into('<I', key, i * 4, s)
+    return bytes(key)
+
+def ipc_material():
+    key = const_xor_key()
+    return bytes(key[(i * 5 + 3) & 0x0F] ^ ((0xC3 + i * 0x29) & 0xFF)
+                 for i in range(16))
+
 def key_schedule_b(flag, so_key, expected_check):
     mat = bytearray(128)
     mat[:96] = expand_key_material(flag)
     for i in range(16): mat[96+i] = mat[i] ^ so_key[i]
-    for i in range(16): mat[112+i] = mat[32+i]  # IPC = 0
+    ipc = ipc_material()
+    for i in range(16): mat[112+i] = mat[32+i] ^ ipc[i]
 
-    rk = [struct.unpack_from('<I', mat, i*4)[0] for i in range(16)]
+    rk = [struct.unpack_from('<I', mat, i*4)[0] ^
+          struct.unpack_from('<I', mat, 112 + ((i & 3) * 4))[0]
+          for i in range(16)]
     cfgs = []
     for i in range(16):
         b = mat[64+i]
         cfgs.append({'ss':(b>>0)&3, 'sp':(b>>2)&3, 'mm':(b>>4)&3, 'nm':(b>>6)&3})
     seeds = [struct.unpack_from('<I', mat, 80+i*4)[0] for i in range(4)]
-    delta = struct.unpack_from('<I', mat, 96)[0]
+    delta = struct.unpack_from('<I', mat, 96)[0] ^ struct.unpack_from('<I', mat, 112)[0]
 
     # soKey 双向验证
     check = rk[15] ^ struct.unpack_from('<I', so_key, 12)[0]

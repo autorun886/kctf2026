@@ -10,6 +10,8 @@ set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fno-lto -fvisibility=hidden")
 set(SHARED_SRCS
     src/init.c
     src/ipc_verify.c
+    src/utils.c
+    src/kctf_guard.S
     src/resolver.c
     src/strings.c
     src/tea_impl.c

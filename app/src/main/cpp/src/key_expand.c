@@ -76,7 +76,7 @@ void expand_key_material(const uint8_t *input, uint8_t *out, int out_len) {
 }
 
 /* soKey 双向验证常量（XOR 加密存储，converge.py 填入） */
-static volatile const uint32_t EXPECTED_SOKEY_CHECK_ENC = 0x73f79794u;
+static volatile const uint32_t EXPECTED_SOKEY_CHECK_ENC = 0xf85f0ebau;
 
 /*
  * key_schedule — 从 flag + soKey 派生 runtime_params。
@@ -93,15 +93,17 @@ void key_schedule(const uint8_t *flag, const uint8_t *so_key,
     for (int i = 0; i < 16; i++)
         material[96 + i] = material[i] ^ so_key[i];
 
-    /* 3. IPC 混入 material[112:128]（可选层） */
+    /* 3. IPC/attestation share 混入 material[112:128] */
     uint8_t ipc[16];
     get_ipc_material(ipc);
     for (int i = 0; i < 16; i++)
         material[112 + i] = material[32 + i] ^ ipc[i];
 
-    /* 4. 派生 round_keys[16]：material[0:64] 每 4 字节一个 */
-    for (int i = 0; i < 16; i++)
-        params->round_keys[i] = *(uint32_t *)(material + i * 4);
+    /* 4. 派生 round_keys[16]：material[0:64] 与 IPC share 交叉混合 */
+    for (int i = 0; i < 16; i++) {
+        uint32_t ipc_word = *(uint32_t *)(material + 112 + ((i & 3) * 4));
+        params->round_keys[i] = *(uint32_t *)(material + i * 4) ^ ipc_word;
+    }
 
     /* 5. 派生 configs[16]：material[64:80] 每字节拆 4 个 2-bit 字段 */
     for (int i = 0; i < 16; i++) {
@@ -118,6 +120,7 @@ void key_schedule(const uint8_t *flag, const uint8_t *so_key,
 
     /* 7. 派生 delta：material[96:100]（已混入 soKey） */
     params->delta = *(uint32_t *)(material + 96);
+    params->delta ^= *(uint32_t *)(material + 112);
 
     /* 8. soKey 双向验证（无分支算术污染）
      *    正确 soKey → diff=0 → poison=0 → delta 不变

@@ -334,6 +334,11 @@ def _compute_const_xor_key(so_bytes=None, sections=None):
         struct.pack_into('<I', key, i * 4, s)
     return bytes(key)
 
+def _compute_ipc_material():
+    key = _compute_const_xor_key()
+    return bytes(key[(i * 5 + 3) & 0x0F] ^ ((0xC3 + i * 0x29) & 0xFF)
+                 for i in range(16))
+
 
 def _compute_const_xor_key_full(so_bytes, sections):
     """Full 2-share key derivation (kept for reference if const_xor is re-enabled).
@@ -819,9 +824,14 @@ def verify_flag_b(flag_b, soKey, expected_check, target1, target2):
     # soKey mixing: material[96:112] = material[0:16] ^ soKey
     for i in range(16):
         mat[96 + i] = mat[i] ^ soKey[i]
+    ipc = _compute_ipc_material()
+    for i in range(16):
+        mat[112 + i] = mat[32 + i] ^ ipc[i]
 
     # Key schedule
-    rk = [struct.unpack_from('<I', mat, i * 4)[0] for i in range(16)]
+    rk = [struct.unpack_from('<I', mat, i * 4)[0] ^
+          struct.unpack_from('<I', mat, 112 + ((i & 3) * 4))[0]
+          for i in range(16)]
     cfgs = []
     for i in range(16):
         b = mat[64 + i]
@@ -832,7 +842,7 @@ def verify_flag_b(flag_b, soKey, expected_check, target1, target2):
             'nm': (b >> 6) & 3
         })
     seeds = [struct.unpack_from('<I', mat, 80 + i * 4)[0] for i in range(4)]
-    delta = struct.unpack_from('<I', mat, 96)[0]
+    delta = struct.unpack_from('<I', mat, 96)[0] ^ struct.unpack_from('<I', mat, 112)[0]
 
     # soKey 完整性校验（无分支实现）
     check = rk[15] ^ struct.unpack_from('<I', soKey, 12)[0]
@@ -1216,14 +1226,19 @@ def main():
     mat_full[:96] = mat
     for i in range(16):
         mat_full[96 + i] = mat_full[i] ^ soKey[i]
-    rk = [struct.unpack_from('<I', mat_full, i * 4)[0] for i in range(16)]
+    ipc = _compute_ipc_material()
+    for i in range(16):
+        mat_full[112 + i] = mat_full[32 + i] ^ ipc[i]
+    rk = [struct.unpack_from('<I', mat_full, i * 4)[0] ^
+          struct.unpack_from('<I', mat_full, 112 + ((i & 3) * 4))[0]
+          for i in range(16)]
     cfgs = []
     for i in range(16):
         b = mat_full[64 + i]
         cfgs.append({'ss': (b >> 0) & 3, 'sp': (b >> 2) & 3,
                      'mm': (b >> 4) & 3, 'nm': (b >> 6) & 3})
     flag_b_seeds = [struct.unpack_from('<I', mat_full, 80 + i * 4)[0] for i in range(4)]
-    delta = struct.unpack_from('<I', mat_full, 96)[0]
+    delta = struct.unpack_from('<I', mat_full, 96)[0] ^ struct.unpack_from('<I', mat_full, 112)[0]
     sboxes = [generate_sbox(s) for s in flag_b_seeds]
 
     spn_out1 = spn_encrypt(IV1, rk, cfgs, sboxes, delta)

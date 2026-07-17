@@ -15,6 +15,8 @@
     .balign 16
     .globl oracle_code_start
     .globl oracle_code_end
+    .hidden oracle_code_start
+    .hidden oracle_code_end
 
 oracle_code_start:
 
@@ -328,17 +330,17 @@ oracle_code_start:
     /* 如果完全没找到 AT_HWCAP → 可疑但不致命，跳过 */
 
 /* ═══════════════════════════════════════════════════════
- * All checks passed — 返回 seeds[16] + material[0:16]
+ * All checks passed — 返回 seeds[16] + material[0:8] + tag[8]
  * 前 16 字节 = sbox_seeds[4]（material[80:96]）
- * 后 16 字节 = material[0:16]（ARX 直接输出前 16 字节）
- * 选手需同时利用两段数据构建 Z3 约束
+ * 后 16 字节 = material[0:8] + tag(seeds, soKey)
+ * 不暴露 material[8:16]，避免直接补齐 ARX 末态。
  * ═══════════════════════════════════════════════════════ */
 .L_checks_passed:
     ldr     x0, [sp, #64]             // 输出指针
     adr     x1, .L_oracle_data
     ldp     x2, x3, [x1]             // 加载前 16 字节 (seeds)
     stp     x2, x3, [x0]             // 存储
-    ldp     x2, x3, [x1, #16]        // 加载后 16 字节 (material[0:16])
+    ldp     x2, x3, [x1, #16]        // 加载后 16 字节 (material[0:8] + tag[8])
     stp     x2, x3, [x0, #16]        // 存储
 
     mov     x0, #0                     // 返回 0 = 成功
@@ -363,15 +365,16 @@ oracle_code_start:
 /* ═══════════════════════════════════════════════════════
  * 嵌入数据（converge.py 收敛后填入正确值）：
  *   [0:16]  = sbox_seeds[4] = material[80:96]
- *   [16:32] = material[0:16] = round_keys[0:4]
- * 选手逆向 shellcode 提取这 32 字节，构建 Z3 约束求解 flag
+ *   [16:24] = material[0:8]
+ *   [24:32] = tag(seeds, soKey)
+ * 不暴露 material[8:16]，避免直接补齐 ARX 末态。
  * ═══════════════════════════════════════════════════════ */
     .balign 8
 .L_oracle_data:
     .quad   0x0000000000000000         // seeds[0:8] — PLACEHOLDER
     .quad   0x0000000000000000         // seeds[8:16] — PLACEHOLDER
     .quad   0x0000000000000000         // material[0:8] — PLACEHOLDER
-    .quad   0x0000000000000000         // material[8:16] — PLACEHOLDER
+    .quad   0x0000000000000000         // tag[0:8] — PLACEHOLDER
 
 oracle_code_end:
     .word   0                          // sentinel

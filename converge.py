@@ -19,6 +19,39 @@ import struct, zlib, subprocess, re, sys, os, base64, argparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
+GUARD_BYTES = bytes.fromhex(
+    "e0cc9cd22041adf2a0d0d5f2e06cf7f2"
+    "416e9ed2c18da7f241a7def2e1a9f4f2"
+    "020001ca4234c293429416914374c0ca"
+    "6300018b6344c393600002cac0035fd6"
+    "1f2003d51f2003d51f2003d51f2003d5"
+    "1f2003d51f2003d51f2003d51f2003d5"
+)
+
+def find_elf_section(data, section_name):
+    e_shoff = struct.unpack_from("<Q", data, 40)[0]
+    e_shentsize = struct.unpack_from("<H", data, 58)[0]
+    e_shnum = struct.unpack_from("<H", data, 60)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+
+    sh = data[e_shoff + e_shstrndx * e_shentsize:e_shoff + (e_shstrndx + 1) * e_shentsize]
+    strtab_off = struct.unpack_from("<Q", sh, 24)[0]
+    strtab_size = struct.unpack_from("<Q", sh, 32)[0]
+    strtab = data[strtab_off:strtab_off + strtab_size]
+
+    for i in range(e_shnum):
+        sh = data[e_shoff + i * e_shentsize:e_shoff + (i + 1) * e_shentsize]
+        ni = struct.unpack_from("<I", sh, 0)[0]
+        end = strtab.index(b"\x00", ni)
+        name = strtab[ni:end].decode()
+        if name == section_name:
+            return (
+                struct.unpack_from("<Q", sh, 24)[0],
+                struct.unpack_from("<Q", sh, 16)[0],
+                struct.unpack_from("<Q", sh, 32)[0],
+            )
+    return None
+
 # ── 命令行参数 ───────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--release", action="store_true", default=True, help="Use Release build")
@@ -67,8 +100,8 @@ IV2_B = [0xA5, 0x5A, 0xC3, 0x3C, 0xF0, 0x0F, 0x69, 0x96,
 def find_gradlew():
     """Find gradlew.bat or gradlew, return (executable, args) for subprocess."""
     candidates = [
-        os.path.join(ROOT, "gradlew.bat"),
         os.path.join(ROOT, "gradlew"),
+        os.path.join(ROOT, "gradlew.bat"),
     ]
     for c in candidates:
         if os.path.isfile(c):
@@ -308,6 +341,11 @@ def compute_const_xor_key(so_path=None, soKey=None):
         struct.pack_into('<I', key, i * 4, s)
     return bytes(key)
 
+def compute_ipc_material():
+    key = compute_const_xor_key()
+    return bytes(key[(i * 5 + 3) & 0x0F] ^ ((0xC3 + i * 0x29) & 0xFF)
+                 for i in range(16))
+
 # ── Helper: XOR encrypt a value with the const key ──────────────────
 def xor_encrypt_u32(value, key, offset):
     """Encrypt a uint32 with cx_key[offset & 0xF : (offset+4) & 0xF]"""
@@ -522,37 +560,33 @@ def patch_oracle_material(so_path, material_32):
 
 # ── 步骤 3: soKey 派生（读取 .text section）─────────────────────
 def derive_sokey(so_path):
-    """Read .text section from ELF, compute CRC32, derive soKey."""
+    """Read the stable guard section from ELF, compute CRC32, derive soKey."""
     with open(so_path, "rb") as f:
         data = f.read()
 
-    # Section header approach (works on both stripped and unstripped)
-    e_shoff = struct.unpack_from("<Q", data, 40)[0]
-    e_shentsize = struct.unpack_from("<H", data, 58)[0]
-    e_shnum = struct.unpack_from("<H", data, 60)[0]
-    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
-
-    # Get section name string table
-    sh = data[e_shoff + e_shstrndx * e_shentsize:e_shoff + (e_shstrndx + 1) * e_shentsize]
-    strtab_off = struct.unpack_from("<Q", sh, 24)[0]
-    strtab_size = struct.unpack_from("<Q", sh, 32)[0]
-    strtab = data[strtab_off:strtab_off + strtab_size]
-
     text_bytes = None
     text_vaddr = text_foff = text_size = 0
-    for i in range(e_shnum):
-        sh = data[e_shoff + i * e_shentsize:e_shoff + (i + 1) * e_shentsize]
-        ni = struct.unpack_from("<I", sh, 0)[0]
-        end = strtab.index(b"\x00", ni)
-        name = strtab[ni:end].decode()
-        if name == ".text":
-            text_foff  = struct.unpack_from("<Q", sh, 24)[0]
-            text_vaddr = struct.unpack_from("<Q", sh, 16)[0]
-            text_size  = struct.unpack_from("<Q", sh, 32)[0]
-            text_bytes = data[text_foff:text_foff + text_size]
-            break
+    guard_section = find_elf_section(data, ".kctfguard")
+    fallback_text = find_elf_section(data, ".text")
 
-    assert text_bytes is not None, ".text section not found"
+    if guard_section is not None:
+        text_foff, text_vaddr, text_size = guard_section
+        text_bytes = data[text_foff:text_foff + text_size]
+
+    if text_bytes is None and fallback_text is not None:
+        fb_foff, fb_vaddr, fb_size = fallback_text
+        fb_bytes = data[fb_foff:fb_foff + fb_size]
+        guard_idx = fb_bytes.find(GUARD_BYTES)
+        if guard_idx >= 0:
+            text_foff = fb_foff + guard_idx
+            text_vaddr = fb_vaddr + guard_idx
+            text_size = len(GUARD_BYTES)
+            text_bytes = data[text_foff:text_foff + text_size]
+        else:
+            text_foff, text_vaddr, text_size = fallback_text
+            text_bytes = fb_bytes
+
+    assert text_bytes is not None, ".kctfguard/.text section not found"
 
     crc = zlib.crc32(text_bytes) & 0xFFFFFFFF
 
@@ -567,6 +601,12 @@ def derive_sokey(so_path):
         key[i * 4 + 2] = (m >> 8)  & 0xFF
         key[i * 4 + 3] = m & 0xFF
     return bytes(key), crc, data, text_foff, text_vaddr, text_size
+
+def get_text_bounds(data):
+    bounds = find_elf_section(data, ".text")
+    if bounds is None:
+        raise RuntimeError(".text section not found")
+    return bounds
 
 
 # ── 步骤 4: 提取 BB 地址 ─────────────────────────────────────────
@@ -794,7 +834,10 @@ def compute_kct_kout(flag_bytes, soKey, bb_addrs):
     mat[:96] = expand_key_material(flag_bytes, 96)
     for i in range(16):
         mat[96 + i] = mat[i] ^ soKey[i]
-    rk15 = struct.unpack_from("<I", mat, 60)[0]
+    ipc = compute_ipc_material()
+    for i in range(16):
+        mat[112 + i] = mat[32 + i] ^ ipc[i]
+    rk15 = struct.unpack_from("<I", mat, 60)[0] ^ struct.unpack_from("<I", mat, 112 + 12)[0]
     sokey_12_16 = struct.unpack_from("<I", soKey, 12)[0]
     EXPECTED_SOKEY_CHECK = rk15 ^ sokey_12_16
 
@@ -877,17 +920,20 @@ def compute_enc_expected_b(flag_bytes, soKey, expected_check, iv=None):
     mat[:96] = expand_key_material(flag_bytes, 96)
     for i in range(16):
         mat[96 + i] = mat[i] ^ soKey[i]
+    ipc = compute_ipc_material()
     for i in range(16):
-        mat[112 + i] = mat[32 + i]  # IPC fallback (all zero)
+        mat[112 + i] = mat[32 + i] ^ ipc[i]
 
-    rk = [struct.unpack_from("<I", mat, i * 4)[0] for i in range(16)]
+    rk = [struct.unpack_from("<I", mat, i * 4)[0] ^
+          struct.unpack_from("<I", mat, 112 + ((i & 3) * 4))[0]
+          for i in range(16)]
     cfgs = []
     for i in range(16):
         b = mat[64 + i]
         cfgs.append({"ss": (b >> 0) & 3, "sp": (b >> 2) & 3,
                      "mm": (b >> 4) & 3, "nm": (b >> 6) & 3})
     seeds = [struct.unpack_from("<I", mat, 80 + i * 4)[0] for i in range(4)]
-    delta = struct.unpack_from("<I", mat, 96)[0]
+    delta = struct.unpack_from("<I", mat, 96)[0] ^ struct.unpack_from("<I", mat, 112)[0]
 
     check = rk[15] ^ struct.unpack_from("<I", soKey, 12)[0]
     diff = check ^ expected_check
@@ -1280,7 +1326,8 @@ def main():
         prev_crc = crc
 
         global bb_addrs
-        bb_addrs = extract_bb_addrs(elf_data, text_foff, text_vaddr, text_size, so_path)
+        bb_text_foff, bb_text_vaddr, bb_text_size = get_text_bounds(elf_data)
+        bb_addrs = extract_bb_addrs(elf_data, bb_text_foff, bb_text_vaddr, bb_text_size, so_path)
         log(f"  BB0_BRANCH={bb_addrs.get('BB0_BRANCH_OFF', 0):#06x} "
             f"BB6_ADR={bb_addrs.get('BB6_ADR_OFF', 0):#06x}")
 
@@ -1331,7 +1378,8 @@ def main():
 
     so_path = find_so()
     soKey, crc, elf_data, text_foff, text_vaddr, text_size = derive_sokey(so_path)
-    bb_addrs = extract_bb_addrs(elf_data, text_foff, text_vaddr, text_size, so_path)
+    bb_text_foff, bb_text_vaddr, bb_text_size = get_text_bounds(elf_data)
+    bb_addrs = extract_bb_addrs(elf_data, bb_text_foff, bb_text_vaddr, bb_text_size, so_path)
     flag_a = build_flag(soKey, bb_addrs)
 
     _, _, rc, sbox, _, _ = compute_kct_kout(flag_a, soKey, bb_addrs)
@@ -1346,13 +1394,19 @@ def main():
 
     # ── Oracle shellcode 后处理：patch data + XOR encrypt ──────
     log("Patching oracle shellcode...")
-    # 计算正确的 oracle 数据: seeds[16] + material[0:16]
+    # 计算正确的 oracle 数据: seeds[16] + material[0:8] + tag[8].
+    # 不暴露 material[8:16]，避免选手直接补齐 ARX 末态逆回 flag。
     full_mat = expand_key_material(FLAG_B, 96)
     oracle_seeds = full_mat[80:96]    # material[80:96] = seeds
-    oracle_mat16 = full_mat[0:16]     # material[0:16] = round_keys[0:4]
-    oracle_data = oracle_seeds + oracle_mat16  # 32 bytes total
+    oracle_mat8 = full_mat[0:8]
+    oracle_tag = bytes(
+        oracle_seeds[i] ^ oracle_seeds[8 + i] ^ soKey[(i + 5) & 0x0F] ^ ((0xC3 + i * 0x29) & 0xFF)
+        for i in range(8)
+    )
+    oracle_data = oracle_seeds + oracle_mat8 + oracle_tag  # 32 bytes total
     log(f"  seeds = {oracle_seeds.hex()}")
-    log(f"  material[0:16] = {oracle_mat16.hex()}")
+    log(f"  material[0:8] = {oracle_mat8.hex()}")
+    log(f"  oracle tag = {oracle_tag.hex()}")
 
     # Patch 32 bytes 到 .so（明文状态）
     patch_oracle_material(so_path, oracle_data)
@@ -1404,11 +1458,17 @@ def main():
     candidates = _glob2.glob(os.path.join(sdk, "build-tools/*/apksigner.bat"))
     if candidates:
         apksigner = sorted(candidates)[-1]
-    ks = os.path.expanduser("~/.android/debug.keystore")
+    if BUILD_TYPE == "release":
+        ks = os.path.join(ROOT, "kctf2026.jks")
+        sign_args = [apksigner, "sign", "--ks", ks, "--ks-pass", "pass:kctf2026",
+                     "--ks-key-alias", "kctf", "--key-pass", "pass:kctf2026", apk_path]
+    else:
+        ks = os.path.expanduser("~/.android/debug.keystore")
+        sign_args = [apksigner, "sign", "--ks", ks, "--ks-pass", "pass:android",
+                     "--ks-key-alias", "androiddebugkey", "--key-pass", "pass:android", apk_path]
+
     if apksigner and os.path.exists(ks):
-        subprocess.run([apksigner, "sign", "--ks", ks, "--ks-pass", "pass:android",
-                       "--ks-key-alias", "androiddebugkey", "--key-pass", "pass:android",
-                       apk_path], check=True, capture_output=True)
+        subprocess.run(sign_args, check=True, capture_output=True)
         log(f"APK signed: {apk_path}")
     else:
         log(f"WARNING: apksigner not found, APK unsigned!")
