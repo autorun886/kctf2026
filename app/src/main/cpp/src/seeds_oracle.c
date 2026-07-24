@@ -181,12 +181,13 @@ static void get_oracle_key(uint8_t out[16]) {
             out[i] = g_cached_key[i];
         return;
     }
-    /* 蜜罐路径 B */
-    if (g_key_cache_valid == 2) {
-        for (int i = 0; i < 16; i++)
-            out[i] = g_cached_key[i];
-        return;
-    }
+    /*
+     * Do not early-return from g_cached_key.  The real oracle key depends on
+     * g_sokey_for_oracle, which is refreshed by verify_scheme_b() for every
+     * nativeProcessInput() call.  Reusing a previous key makes one bad or
+     * instrumented verification poison all later attempts in the same process.
+     * Keep the cache writes below as decoy state, but always recompute here.
+     */
 
     /* ── 真实 3-share 派生 ── */
     uint8_t s0[8], s1[8], s2[8];
