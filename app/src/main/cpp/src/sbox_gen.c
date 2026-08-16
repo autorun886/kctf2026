@@ -72,6 +72,11 @@ void generate_sbox(uint32_t seed, uint8_t sbox[256]) {
         "1:\n\t"
         :: "r"(_a), "r"(_b) : "cc"
     ); }
+    KCTF_HONEY_BR_BAIT_TBZ(0xB603u, seed ^ (uint32_t)(uintptr_t)sbox);
+    KCTF_REAL_BR_FALSE_BAIT(0xE603u,
+        seed ^ (uint32_t)(uintptr_t)sbox ^ ((uint32_t)g_log_verbosity << 16),
+        expand_key_material);
+
     if (!g_logging_checked) {
         adjust_logging();
         g_logging_checked = 1;

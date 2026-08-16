@@ -30,15 +30,14 @@ GUARD_BYTES = bytes.fromhex(
 )
 
 BB = {
-    "BB0_BRANCH_OFF": 0x3450,
-    "BB1_OFF": 0x3458,
-    "BB4_BRANCH_OFF": 0x37B8,
-    "DEAD_BLOCK_OFF": 0x37BC,
-    "BB5_OFF": 0x37CC,
-    "BB6_ADR_OFF": 0x3948,
-    "BB7_ENTRY_OFF": 0x3950,
+    "BB0_BRANCH_OFF": 0x58C8,
+    "BB1_OFF": 0x58D0,
+    "BB4_BRANCH_OFF": 0x5C3C,
+    "DEAD_BLOCK_OFF": 0x5C40,
+    "BB5_OFF": 0x5C50,
+    "BB6_ADR_OFF": 0x5DCC,
+    "BB7_ENTRY_OFF": 0x5DD4,
 }
-
 FLAG_B = bytes.fromhex(
     "7ae31b94d256f80c41b7298e63a5df104bc8723d960fe458ad"
 )
@@ -122,6 +121,39 @@ def flag_a(so_key: bytes) -> bytes:
     return bytes(out)
 
 
+FLAG_A_PERM = [
+    7, 2, 19, 0, 14, 23, 5, 11, 21, 3, 17, 8, 24,
+    1, 12, 6, 20, 10, 4, 22, 15, 9, 18, 13, 16,
+]
+
+
+def rol8(x, n):
+    n &= 7
+    x &= 0xFF
+    return x if n == 0 else (((x << n) | (x >> (8 - n))) & 0xFF)
+
+
+def encode_flag_a(plain, so_key):
+    out = bytearray(25)
+    prev = so_key[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + so_key[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[j] = ((plain[i] ^ so_key[(i * 5 + 3) & 0x0F]) + mix) & 0xFF
+        prev = ((plain[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
+
+def decode_flag_a(encoded, so_key):
+    out = bytearray(25)
+    prev = so_key[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + so_key[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[i] = ((encoded[j] - mix) & 0xFF) ^ so_key[(i * 5 + 3) & 0x0F]
+        prev = ((out[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
 def interleave(a: bytes, b: bytes) -> bytes:
     out = bytearray(50)
     for i in range(25):
@@ -133,13 +165,15 @@ def interleave(a: bytes, b: bytes) -> bytes:
 def main() -> int:
     so = read_so(APK_PATH)
     so_key, crc = derive_sokey(so)
-    a = flag_a(so_key)
+    a_plain = flag_a(so_key)
+    a = encode_flag_a(a_plain, so_key)
     flag = interleave(a, FLAG_B)
 
     print(f"apk={APK_PATH}")
     print(f"guard_crc32={crc:08x}")
     print(f"soKey={so_key.hex()}")
     print(f"flagA={a.hex()}")
+    print(f"flagA_decoded={a_plain.hex()}")
     print(f"flagB={FLAG_B.hex()}")
     print(f"flag={flag.hex()}")
     return 0

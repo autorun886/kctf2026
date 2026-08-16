@@ -18,6 +18,8 @@
  *   5  read
  *   6  close
  *   7  mprotect
+ *   8  mmap
+ *   9  munmap
  */
 
 /* ── 加密函数名（precomputed）──────────────────────────── */
@@ -53,17 +55,26 @@ static const uint8_t RN_7[] = {
     0xD4,0xD6,0xF5,0x8B,0xB1,0x47,0x60,0x14
 };  /* mprotect */
 
+static const uint8_t RN_8[] = {
+    0x79,0x66,0x4B,0x39
+};  /* mmap */
+
+static const uint8_t RN_9[] = {
+    0x02,0x05,0x3F,0x5F,0x72,0x84
+};  /* munmap */
+
 static const struct {
     const uint8_t *enc;
     uint8_t        len;
-} RN_TABLE[8] = {
+} RN_TABLE[10] = {
     { RN_0, 13 }, { RN_1,  5 }, { RN_2,  5 }, { RN_3,  6 },
     { RN_4,  4 }, { RN_5,  4 }, { RN_6,  5 }, { RN_7,  8 },
+    { RN_8,  4 }, { RN_9,  6 },
 };
 
 /* ── 解析缓存 ─────────────────────────────────────────── */
-static void *g_cache[8];
-static int   g_resolved[8];
+static void *g_cache[10];
+static int   g_resolved[10];
 
 /* ── 解密函数名到临时缓冲区 ──────────────────────────── */
 static void decrypt_name(int id, char out[32]) {
@@ -89,7 +100,7 @@ void *get_func(const char *name) {
 
 /* get_func_by_id — 内部使用，按 ID 解析 */
 void *get_func_by_id(int id) {
-    if (id < 0 || id >= 8) return NULL;
+    if (id < 0 || id >= 10) return NULL;
     if (g_resolved[id]) return g_cache[id];
 
     char fname[32];

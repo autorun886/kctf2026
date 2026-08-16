@@ -10,13 +10,13 @@ extern uint32_t xtea_delta;
 /* ── 合法 BB 入口偏移表（converge.py 自动填入）──────── */
 /* ── BB 偏移（相对 .text 起始，converge.py 自动填入）── */
 /* volatile const → .rodata，不影响 .text CRC */
-static volatile const uint32_t BB0_BRANCH_OFF = 0x3434u;
-static volatile const uint32_t BB1_OFF        = 0x343cu;
-static volatile const uint32_t BB6_ADR_OFF_V  = 0x392cu;
-static volatile const uint32_t BB7_ENTRY_OFF  = 0x3934u;
-static volatile const uint32_t BB4_BRANCH_OFF = 0x379cu;
-static volatile const uint32_t BB5_OFF        = 0x37b0u;
-static volatile const uint32_t DEAD_BLOCK_OFF = 0x37a0u;
+static volatile const uint32_t BB0_BRANCH_OFF = 0xedb0u;
+static volatile const uint32_t BB1_OFF        = 0xedb8u;
+static volatile const uint32_t BB6_ADR_OFF_V  = 0xf2b4u;
+static volatile const uint32_t BB7_ENTRY_OFF  = 0xf2bcu;
+static volatile const uint32_t BB4_BRANCH_OFF = 0xf124u;
+static volatile const uint32_t BB5_OFF        = 0xf138u;
+static volatile const uint32_t DEAD_BLOCK_OFF = 0xf128u;
 
 /* dispatch table（BB6→BB7 间接跳转，验证用） */
 uint32_t dispatch_table[4] = {0,0,0,0};
@@ -43,6 +43,11 @@ void repair_cfg(const uint8_t *flag, const uint8_t *so_key) {
         "1:\n\t"
         :: "r"(_a), "r"(_b) : "cc"
     ); }
+    KCTF_HONEY_BR_BAIT_TBZ(0xA001u,
+        (*(const uint32_t *)flag) ^ (*(const uint32_t *)so_key) ^ BB0_BRANCH_OFF);
+    KCTF_REAL_BR_FALSE_BAIT_CSEL(0xD001u,
+        (*(const uint32_t *)(flag + 5)) ^ (*(const uint32_t *)(so_key + 8)) ^ BB6_ADR_OFF_V,
+        core_compute);
 
     /* ── 1. 验证 flag[0:4]：BB0→BB1 跳转偏移 ──────────── */
     uint32_t flag_imm26 = (*(const uint32_t *)flag) & 0x03FFFFFFu;

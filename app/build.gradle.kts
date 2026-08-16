@@ -64,6 +64,11 @@ android {
     buildFeatures {
         viewBinding = true
     }
+    packaging {
+        resources {
+            excludes += "DebugProbesKt.bin"
+        }
+    }
 }
 
 dependencies {

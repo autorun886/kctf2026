@@ -14,8 +14,8 @@ static const uint32_t KIN[8]  = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
 static volatile const uint32_t KOUT_ENC[8] = {
-    0x992e6fc8u, 0xa68ddd9fu, 0xca9910a3u, 0x85011d60u,
-    0x719d49d2u, 0x742da00bu, 0xcc673eb3u, 0x81a07edau
+    0x82afa7c8u, 0x8a0b659fu, 0x261758a3u, 0xee834560u,
+    0x151f01d2u, 0x98a3f80cu, 0xe8e0f6b3u, 0xe53e36dau
 };
 
 static inline uint32_t s3_check(uint32_t val, uint32_t param) {
@@ -46,12 +46,17 @@ void repair_semantics(const uint8_t *flag, uint8_t rc_high4) {
         "1:\n\t"
         :: "r"(_a), "r"(_b) : "cc"
     ); }
+    KCTF_HONEY_BR_BAIT(0xA304u,
+        ((uint32_t)flag[21] << 24) ^ round_constants[0] ^ ((uint32_t)rc_high4 << 8));
+    KCTF_REAL_BR_FALSE_BAIT_CSEL(0xD304u,
+        ((uint32_t)flag[22] | ((uint32_t)flag[23] << 8) |
+         ((uint32_t)flag[24] << 16)) ^ round_constants[31],
+        core_compute);
 
     /* 蜜罐 D：独立 BRK 扫描（不共享 spn_round.c 的全局变量） */
-    extern char __executable_start;
-    uint32_t *code = (uint32_t *)&__executable_start;
+    const volatile uint32_t *code = (const volatile uint32_t *)(uintptr_t)core_compute;
     int brk_count = 0;
-    for (int i = 0; i < 1024; i++) {
+    for (int i = 0; i < 256; i++) {
         if ((code[i] & 0xFFE00000u) == 0xD4200000u)
             brk_count++;
     }

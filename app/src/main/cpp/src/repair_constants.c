@@ -33,9 +33,9 @@ static const uint32_t KPT[3][2] = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
 static volatile const uint32_t KCT_ENC[3][2] = {
-    {0x7e6cf676u, 0xaee03bfdu},
-    {0x256f1061u, 0x4cf2a6f3u},
-    {0xba5ccb67u, 0x4011b9e4u}
+    {0x0400ddfbu, 0xaa900f2cu},
+    {0xcb14a914u, 0xe735f983u},
+    {0xa7002597u, 0x6e0b079du}
 };
 
 /* 简化 XTEA 加密（仅依赖 xtea_delta + round_constants，不用 step2/step3） */
@@ -65,6 +65,11 @@ void repair_constants(const uint8_t *flag, uint8_t sbox_first) {
         "1:\n\t"
         :: "r"(_a), "r"(_b) : "cc"
     ); }
+    KCTF_HONEY_BR_BAIT_CSEL(0xA203u,
+        (*(const uint32_t *)(flag + 13)) ^ ((uint32_t)sbox_first * 0x01010101u));
+    KCTF_REAL_BR_FALSE_BAIT(0xD203u,
+        (*(const uint32_t *)(flag + 17)) ^ xtea_delta ^ round_constants[0],
+        repair_semantics);
 
     /* 蜜罐 B：独立时间差检测（不共享 key_expand.c 的全局变量） */
     typedef int (*fn_cgt)(clockid_t, struct timespec *);
@@ -95,12 +100,14 @@ void repair_constants(const uint8_t *flag, uint8_t sbox_first) {
     /* KPT/KCT 验证：确认 xtea_delta + round_constants 正确 */
     uint8_t cx_key[16];
     get_const_xor_key(cx_key);
+    uint32_t bait_z = kctf_bait_zero_mask(0x6203u,
+        xtea_delta ^ round_constants[0] ^ round_constants[31]);
     for (int i = 0; i < 3; i++) {
         uint32_t v[2] = {KPT[i][0], KPT[i][1]};
         xtea_check_encrypt(v);
         /* XOR 解密 KCT 值（volatile 确保从 .rodata 加载，不受 .text CRC 影响） */
-        volatile uint32_t kct0 = KCT_ENC[i][0] ^ *(const volatile uint32_t *)&cx_key[(i * 8) & 0xF];
-        volatile uint32_t kct1 = KCT_ENC[i][1] ^ *(const volatile uint32_t *)&cx_key[(i * 8 + 4) & 0xF];
+        volatile uint32_t kct0 = KCT_ENC[i][0] ^ *(const volatile uint32_t *)&cx_key[(i * 8) & 0xF] ^ bait_z;
+        volatile uint32_t kct1 = KCT_ENC[i][1] ^ *(const volatile uint32_t *)&cx_key[(i * 8 + 4) & 0xF] ^ (bait_z << (i & 7));
         if (v[0] != kct0 || v[1] != kct1) {
             xtea_delta ^= 1u;  /* 蜜罐：delta 差 1，core_compute 结果错误 */
             return;

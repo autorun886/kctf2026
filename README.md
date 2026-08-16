@@ -25,7 +25,7 @@
 ## 选手视角题解
 
 1. 定位入口：`MainActivity` 将输入 hex 解码为 50 字节，调用 `nativeProcessInput(byte[])`。JNI 中按奇偶位拆分为 `flagA` 和 `flagB`。
-2. 恢复 `soKey`：逆向 `deriveNativeKey()`，从 APK 提取 `lib/arm64-v8a/libkctf.so`，解析 ELF section，计算 guard bytes 的 CRC32，再按 LCG 逻辑得到 16 字节 `soKey`。
+2. 恢复 `soKey`：逆向 Java 侧短名 metadata helper 和 native 侧反射 token 解码，从 APK 提取 `lib/arm64-v8a/libkctf.so`，解析 ELF section，计算 guard bytes 的 CRC32，再按 LCG 逻辑得到 16 字节 `soKey`。
 3. 解方案 A：从 `repair_cfg.c` 和 `core_compute` 反推出 BB 偏移，恢复 `flagA[0:13]`；再跟进 `repair_sbox`、`repair_constants`、`repair_semantics`，得到 XTEA delta、LCG seed、step2/step3 参数。最终 `core_compute` 的输出要等于 `ENC_EXPECTED_STATE_A ^ soKey`。
 4. 解方案 B：实现 `expand_key_material` 的 ARX 逻辑，恢复 `key_schedule` 对 round keys、configs、seeds、delta 的派生；实现 S-Box 生成和 SPN 16 轮正向模拟。
 5. 建模求解：以 `flagB[25]` 为 200 bit 变量，加入 IV1 和 IV2 两组最终状态约束。Oracle 给出的 seeds 和 `material[0:8]` 可作为早期约束，但不能直接补齐 ARX 末态。
@@ -35,9 +35,10 @@
 
 - `guard_crc32 = 3e0695ce`
 - `soKey = 870573e5f5c63d52862dbd05ab3d9494`
-- `flagA = 0200000001832dbd05c70573e5b979379edec0adde07421337`
+- `flagA = a77a78ffc894367d1bf5bb3faab6e2f4db0070533de8b73443`
+- `flagA_decoded = 0200000001832dbd05c70573e5b979379edec0adde07421337`
 - `flagB = 7ae31b94d256f80c41b7298e63a5df104bc8723d960fe458ad`
-- `flag = 027a00e3001b009401d283562df8bd0c0541c7b70529738ee563b9a579df37109e4bdec8c072ad3dde96070f42e4135837ad`
+- `flag = a77a7ae3781bff94c8d2945636f87d0c1b41f5b7bb293f8eaa63b6a5e2dff410db4b00c87072533d3d96e80fb7e4345843ad`
 
 ## Flag Generate 脚本
 

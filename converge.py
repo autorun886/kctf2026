@@ -15,9 +15,48 @@ converge.py -- KCTF2026 自动化常量收敛脚本
      设置 --release 使用 Release build，--debug 使用 Debug build
 """
 
-import struct, zlib, subprocess, re, sys, os, base64, argparse
+import struct, zlib, subprocess, re, sys, os, base64, argparse, glob, shutil
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+def _android_sdk_roots():
+    roots = []
+    for value in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")):
+        if value:
+            roots.append(os.path.expanduser(value))
+    roots.extend([
+        os.path.expanduser("~/Android/Sdk"),
+        os.path.expanduser("~/AppData/Local/Android/Sdk"),
+    ])
+    seen = set()
+    out = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            out.append(root)
+    return out
+
+def find_ndk_tool(tool):
+    names = [tool, f"{tool}.exe"]
+    prebuilts = ["linux-x86_64", "windows-x86_64", "darwin-x86_64", "darwin-arm64"]
+    for root in _android_sdk_roots():
+        for ndk_dir in sorted(glob.glob(os.path.join(root, "ndk", "*")), reverse=True):
+            for prebuilt in prebuilts:
+                for name in names:
+                    candidate = os.path.join(ndk_dir, "toolchains", "llvm", "prebuilt", prebuilt, "bin", name)
+                    if os.path.isfile(candidate):
+                        return candidate
+    return shutil.which(tool) or shutil.which(f"{tool}.exe")
+
+def find_build_tool(tool):
+    names = [tool, f"{tool}.bat", f"{tool}.exe"]
+    for root in _android_sdk_roots():
+        for build_tools in sorted(glob.glob(os.path.join(root, "build-tools", "*")), reverse=True):
+            for name in names:
+                candidate = os.path.join(build_tools, name)
+                if os.path.isfile(candidate):
+                    return candidate
+    return shutil.which(tool) or shutil.which(f"{tool}.bat") or shutil.which(f"{tool}.exe")
 
 GUARD_BYTES = bytes.fromhex(
     "e0cc9cd22041adf2a0d0d5f2e06cf7f2"
@@ -69,6 +108,10 @@ def log(msg):
 
 def ror64(x, n): return ((x >> n) | (x << (64 - n))) & ((1 << 64) - 1)
 def rol64(x, n): return ((x << n) | (x >> (64 - n))) & ((1 << 64) - 1)
+def rol32(x, n):
+    n &= 31
+    x &= 0xFFFFFFFF
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF if n else x
 
 def _crc32_16(data):
     """CRC32 of 16 bytes using half-byte table (matches C state_checksum)."""
@@ -90,6 +133,8 @@ FLAG_B = bytes([
     0x41, 0xB7, 0x29, 0x8E, 0x63, 0xA5, 0xDF, 0x10,
     0x4B, 0xC8, 0x72, 0x3D, 0x96, 0x0F, 0xE4, 0x58, 0xAD
 ])
+TARGET_SCHEME_A_SHARE = 0xD7
+SCHEME_A_SHARE_TUNE = 0xc4
 
 # ── IV2（方案 B 第二次 SPN，唯一性约束）────────────────────────
 IV2_B = [0xA5, 0x5A, 0xC3, 0x3C, 0xF0, 0x0F, 0x69, 0x96,
@@ -152,7 +197,7 @@ def find_so():
 
 
 # ── Oracle shellcode XOR 加密（构建后处理）──────────────────────
-# 与 seeds_oracle.c 中 get_oracle_key() 的 3-share 派生完全一致
+# 与 seeds_oracle.c 中 get_oracle_key() 的 4-share 派生完全一致
 _KDF_IV = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
            0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
 
@@ -206,15 +251,9 @@ def _crc32_half_byte(data):
 
 def _compute_share1(so_path):
     """Share 1: expand_key_material 前 128 字节代码的 CRC32"""
-    # 找到 expand_key_material 的文件偏移
-    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-    if not os.path.isfile(nm):
-        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
-            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
-            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-            if os.path.isfile(nm):
-                break
+    nm = find_ndk_tool("llvm-nm")
+    if not nm:
+        raise RuntimeError("llvm-nm not found")
 
     with open(so_path, "rb") as f:
         data = f.read()
@@ -260,6 +299,97 @@ def _compute_share1(so_path):
     second8 = struct.pack('<II', crc_c, crc_d)
 
     return first8, second8
+
+def _oracle_gf_mul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return r & 0xFF
+
+
+def _oracle_mds32(x):
+    a0 = x & 0xFF
+    a1 = (x >> 8) & 0xFF
+    a2 = (x >> 16) & 0xFF
+    a3 = (x >> 24) & 0xFF
+    b0 = _oracle_gf_mul(a0, 2) ^ _oracle_gf_mul(a1, 3) ^ a2 ^ a3
+    b1 = a0 ^ _oracle_gf_mul(a1, 2) ^ _oracle_gf_mul(a2, 3) ^ a3
+    b2 = a0 ^ a1 ^ _oracle_gf_mul(a2, 2) ^ _oracle_gf_mul(a3, 3)
+    b3 = _oracle_gf_mul(a0, 3) ^ a1 ^ a2 ^ _oracle_gf_mul(a3, 2)
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+
+def _oracle_inv_mds32(x):
+    a0 = x & 0xFF
+    a1 = (x >> 8) & 0xFF
+    a2 = (x >> 16) & 0xFF
+    a3 = (x >> 24) & 0xFF
+    b0 = _oracle_gf_mul(a0, 0x0E) ^ _oracle_gf_mul(a1, 0x0B) ^ _oracle_gf_mul(a2, 0x0D) ^ _oracle_gf_mul(a3, 0x09)
+    b1 = _oracle_gf_mul(a0, 0x09) ^ _oracle_gf_mul(a1, 0x0E) ^ _oracle_gf_mul(a2, 0x0B) ^ _oracle_gf_mul(a3, 0x0D)
+    b2 = _oracle_gf_mul(a0, 0x0D) ^ _oracle_gf_mul(a1, 0x09) ^ _oracle_gf_mul(a2, 0x0E) ^ _oracle_gf_mul(a3, 0x0B)
+    b3 = _oracle_gf_mul(a0, 0x0B) ^ _oracle_gf_mul(a1, 0x0D) ^ _oracle_gf_mul(a2, 0x09) ^ _oracle_gf_mul(a3, 0x0E)
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+
+def _oracle_fbox32(x, k):
+    x = (x ^ k) & 0xFFFFFFFF
+    x = (x * 0x45D9F3B) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x119DE1F3) & 0xFFFFFFFF
+    x ^= x >> 15
+    return x & 0xFFFFFFFF
+
+
+def _oracle_feistel32(x, k):
+    l = x & 0xFFFF
+    r = (x >> 16) & 0xFFFF
+    l ^= _oracle_fbox32(r, k) & 0xFFFF
+    r ^= _oracle_fbox32(l, k ^ 0x9E37) & 0xFFFF
+    return (l | (r << 16)) & 0xFFFFFFFF
+
+
+def _oracle_inv_feistel32(x, k):
+    l = x & 0xFFFF
+    r = (x >> 16) & 0xFFFF
+    r ^= _oracle_fbox32(l, k ^ 0x9E37) & 0xFFFF
+    l ^= _oracle_fbox32(r, k) & 0xFFFF
+    return (l | (r << 16)) & 0xFFFFFFFF
+
+
+def _oracle_identity32(x, salt):
+    k = _oracle_fbox32(salt & 0xFFFFFFFF, 0xD1B54A32)
+    y = _oracle_inv_mds32(_oracle_mds32((x ^ k) & 0xFFFFFFFF)) ^ k
+    return _oracle_inv_feistel32(
+        _oracle_feistel32(y, k ^ 0x94D049BB),
+        k ^ 0x94D049BB,
+    )
+
+
+def _oracle_env_clean_byte(i):
+    x = (0xC3D2E1F0 ^ ((i * 0x45D9F3B) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    x = _oracle_identity32(x ^ (x >> 16), i ^ 0xC2B2AE35)
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x = _oracle_identity32(x ^ (x >> 15), i ^ 0x27D4EB2F)
+    y = _oracle_identity32(
+        x ^ (x >> 8) ^ ((0xA7 + i * 0x31) & 0xFFFFFFFF),
+        i ^ 0x165667B1,
+    )
+    return y & 0xFF
+
+def _compute_oracle_env_share_clean():
+    out = bytearray(16)
+    bad_mix = _oracle_identity32(0, 0x85EBCA77)
+    for i in range(16):
+        x = (bad_mix + ((i * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        x = _oracle_identity32(x ^ (x >> ((i & 7) + 5)), bad_mix ^ i)
+        out[i] = (_oracle_env_clean_byte(i) ^ (x & 0xFF)) & 0xFF
+    return bytes(out)
 
 def _compute_share2(soKey):
     """Share 2: soKey 变换"""
@@ -357,17 +487,20 @@ def xor_encrypt_bytes(data, key):
     return bytes(data[i] ^ key[i & 0xF] for i in range(len(data)))
 
 def compute_oracle_xor_key(so_path, soKey):
-    """计算 3-share oracle XOR key（需要 .so 路径和 soKey）"""
+    """计算 4-share oracle XOR key（需要 .so 路径和 soKey）。
+    第四份 oracle_env_share 使用 clean-path 固定值；运行时环境异常会派生 bad share。
+    """
     s0_first = _compute_share0_first()
     s0_second = _compute_share0_second()
     s1_first, s1_second = _compute_share1(so_path)
     s2_first, s2_second = _compute_share2(soKey)
+    env = _compute_oracle_env_share_clean()
 
     key = bytearray(16)
     for i in range(8):
-        key[i] = s0_first[i] ^ s1_first[i] ^ s2_first[i]
+        key[i] = s0_first[i] ^ s1_first[i] ^ s2_first[i] ^ env[i]
     for i in range(8):
-        key[8+i] = s0_second[i] ^ s1_second[i] ^ s2_second[i]
+        key[8+i] = s0_second[i] ^ s1_second[i] ^ s2_second[i] ^ env[8+i]
 
     return bytes(key)
 
@@ -423,16 +556,8 @@ def encrypt_oracle_section(so_path, soKey):
 
 def _encrypt_oracle_by_symbol(so_path, data, oracle_key):
     """Fallback: find oracle_code_start/end via symbol table and XOR that range."""
-    # Use llvm-nm to find symbols
-    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-    if not os.path.isfile(nm):
-        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
-            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
-            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-            if os.path.isfile(nm):
-                break
-    if not os.path.isfile(nm):
+    nm = find_ndk_tool("llvm-nm")
+    if not nm:
         log("  WARNING: llvm-nm not found, cannot encrypt oracle section")
         return False
 
@@ -489,22 +614,44 @@ def _encrypt_oracle_by_symbol(so_path, data, oracle_key):
     return True
 
 
+def oracle_payload_table():
+    """Generate the 16-byte table consumed by seeds_oracle.S."""
+    table = bytearray(16)
+    for i in range(16):
+        base = rol8((0xC3 + i * 0x29) & 0xFF, (i & 7) + 1)
+        table[i] = base ^ ((i * 0x5D + 0x71) & 0xFF) ^ 0xA5
+    return bytes(table)
+
+
+def encode_oracle_payload_blob(plain_32):
+    """Encode oracle payload the same way seeds_oracle.S decodes .L_oracle_data."""
+    if len(plain_32) != 32:
+        raise ValueError("oracle payload must be exactly 32 bytes")
+    table = oracle_payload_table()
+    out = bytearray(48)
+    out[32:48] = table
+    for i, b in enumerate(plain_32):
+        pos = (i * 5 + 11) & 31
+        j = (i * 7 + 5) & 15
+        k = (i * 11 + 9) & 15
+        mask = table[j] ^ rol8(table[k], (i & 7) + 1)
+        mask ^= ((i * 0x3D + 0xA7) ^ ((i << 1) & 0xFF)) & 0xFF
+        out[pos] = b ^ mask
+    return bytes(out)
+
+
 def patch_oracle_material(so_path, material_32):
-    """Patch the 32 bytes material[0:32] into the oracle shellcode's .L_material_data.
-    Material data is at the end of oracle_code (32 bytes + 4 byte sentinel before oracle_code_end).
+    """Patch encoded oracle payload into the shellcode's .L_oracle_data.
+    Data is at the end of oracle_code (48 bytes + 4 byte sentinel before oracle_code_end).
     Must be called BEFORE encrypt_oracle_section."""
     with open(so_path, "rb") as f:
         data = bytearray(f.read())
 
-    # Find oracle_code_end symbol to locate material (32+4 bytes before it)
-    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-    if not os.path.isfile(nm):
-        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
-            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
-            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-            if os.path.isfile(nm):
-                break
+    # Find oracle_code_end symbol to locate material (48 bytes before it)
+    nm = find_ndk_tool("llvm-nm")
+    if not nm:
+        log("  WARNING: cannot patch oracle material (llvm-nm not found)")
+        return False
 
     try:
         out = subprocess.check_output([nm, "--defined-only", so_path], text=True,
@@ -524,8 +671,8 @@ def patch_oracle_material(so_path, material_32):
         log("  WARNING: oracle_code_end symbol not found")
         return False
 
-    # Layout: [.L_material_data: 32 bytes] [oracle_code_end] [sentinel: 4 bytes]
-    material_va = end_va - 32
+    # Layout: [.L_oracle_data: 48 encoded bytes/table] [oracle_code_end] [sentinel: 4 bytes]
+    material_va = end_va - 48
 
     # VA to file offset
     e_phoff = struct.unpack_from("<Q", data, 32)[0]
@@ -549,12 +696,12 @@ def patch_oracle_material(so_path, material_32):
         log("  WARNING: cannot map material VA to file offset")
         return False
 
-    # Write 32 bytes
-    data[file_offset:file_offset + 32] = material_32
+    encoded = encode_oracle_payload_blob(material_32)
+    data[file_offset:file_offset + 48] = encoded
 
     with open(so_path, "wb") as f:
         f.write(data)
-    log(f"  oracle material[0:32] patched at file offset 0x{file_offset:x}")
+    log(f"  oracle payload blob patched at file offset 0x{file_offset:x}")
     return True
 
 
@@ -612,16 +759,8 @@ def get_text_bounds(data):
 # ── 步骤 4: 提取 BB 地址 ─────────────────────────────────────────
 def find_core_compute_bounds(data, text_foff, text_vaddr, text_size, so_path):
     """Find core_compute function boundaries using llvm-nm (NDK)."""
-    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-    nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-    if not os.path.isfile(nm):
-        # Try finding any NDK version
-        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
-            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
-            nm = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
-            if os.path.isfile(nm):
-                break
-    if not os.path.isfile(nm):
+    nm = find_ndk_tool("llvm-nm")
+    if not nm:
         log("llvm-nm not found, scanning entire .text (may produce wrong BB offsets)")
         return None, None
 
@@ -844,7 +983,496 @@ def compute_kct_kout(flag_bytes, soKey, bb_addrs):
     return KCT, KOUT, rc, sbox, step3_bits, EXPECTED_SOKEY_CHECK
 
 
-def compute_enc_expected_a(flag_bytes, soKey, bb_addrs, rc, sbox):
+
+def apply_cross_mask(data, share, domain):
+    out = bytearray(data)
+    x = (share ^ domain) & 0xFF
+    for i in range(16):
+        x = ((x * 0x3D) + (0x71 + i * 0x13)) & 0xFF
+        out[i] ^= (x ^ (x >> 3)) & 0xFF
+    return bytes(out)
+
+def derive_material_share(flag_b):
+    material = expand_key_material(flag_b, 96)
+    r = ((material[95] << 1) | (material[95] >> 7)) & 0xFF
+    return (material[60] ^ material[80] ^ r ^ 0x5D) & 0xFF
+
+def derive_fake_syndrome(flag_b, a_share, lane_ctx=0):
+    material = expand_key_material(flag_b, 32)
+    cx_key = compute_const_xor_key()
+    hint_enc = bytes([
+        0xB2, 0x71, 0x0E, 0x5D, 0x93, 0x42, 0xC8, 0x1F,
+        0x2A, 0xE4, 0x77, 0x90, 0x5C, 0x39, 0xA6, 0xD1,
+    ])
+    hint = bytearray(hint_enc[i] ^ cx_key[i & 0x0F] for i in range(16))
+    for i in range(16):
+        ctx_byte = (lane_ctx >> ((i & 3) * 8)) & 0xFF
+        hint[i] ^= ((a_share ^ ctx_byte) + i * 0x2B) & 0xFF
+
+    syndrome = ((a_share + 0x6D) & 0xFF) ^ (material[7] ^ (lane_ctx & 0xFF))
+    for i in range(16):
+        lane = material[8 + ((i * 5 + 3) & 0x0F)]
+        d = lane ^ hint[i]
+        echo = rol8(material[16 + ((i * 3 + 1) & 0x0F)], i + 1)
+        d ^= echo
+        d ^= (lane_ctx >> (((i + 1) & 3) * 8)) & 0xFF
+        syndrome = (syndrome + ((d + i * 0x17) & 0xFF)) & 0xFF
+        syndrome = rol8(syndrome, (i & 3) + 1)
+        mix = (d * 0x3D + i) & 0xFF
+        syndrome ^= mix
+        lane_ctx = (lane_ctx ^ (mix << ((i & 3) * 8))) & 0xFFFFFFFF
+        lane_ctx = (lane_ctx + ((d * 0x01010101) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        lane_ctx = rol32(lane_ctx, (mix & 7) + 3)
+    return syndrome & 0xFF
+
+def derive_material_mid_tag(material, seeds, soKey, a_share, lane_ctx=0):
+    def mds32(x):
+        def gf_mul(a, b):
+            r = 0
+            for _ in range(8):
+                if b & 1:
+                    r ^= a
+                hi = a & 0x80
+                a = (a << 1) & 0xFF
+                if hi:
+                    a ^= 0x1B
+                b >>= 1
+            return r & 0xFF
+        a0 = x & 0xFF
+        a1 = (x >> 8) & 0xFF
+        a2 = (x >> 16) & 0xFF
+        a3 = (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 2) ^ gf_mul(a1, 3) ^ a2 ^ a3
+        b1 = a0 ^ gf_mul(a1, 2) ^ gf_mul(a2, 3) ^ a3
+        b2 = a0 ^ a1 ^ gf_mul(a2, 2) ^ gf_mul(a3, 3)
+        b3 = gf_mul(a0, 3) ^ a1 ^ a2 ^ gf_mul(a3, 2)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def inv_mds32(x):
+        def gf_mul(a, b):
+            r = 0
+            for _ in range(8):
+                if b & 1:
+                    r ^= a
+                hi = a & 0x80
+                a = (a << 1) & 0xFF
+                if hi:
+                    a ^= 0x1B
+                b >>= 1
+            return r & 0xFF
+        a0 = x & 0xFF
+        a1 = (x >> 8) & 0xFF
+        a2 = (x >> 16) & 0xFF
+        a3 = (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 0x0E) ^ gf_mul(a1, 0x0B) ^ gf_mul(a2, 0x0D) ^ gf_mul(a3, 0x09)
+        b1 = gf_mul(a0, 0x09) ^ gf_mul(a1, 0x0E) ^ gf_mul(a2, 0x0B) ^ gf_mul(a3, 0x0D)
+        b2 = gf_mul(a0, 0x0D) ^ gf_mul(a1, 0x09) ^ gf_mul(a2, 0x0E) ^ gf_mul(a3, 0x0B)
+        b3 = gf_mul(a0, 0x0B) ^ gf_mul(a1, 0x0D) ^ gf_mul(a2, 0x09) ^ gf_mul(a3, 0x0E)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def fbox32(x, k):
+        x = (x ^ k) & 0xFFFFFFFF
+        x = (x * 0x45D9F3B) & 0xFFFFFFFF
+        x ^= x >> 16
+        x = (x * 0x119DE1F3) & 0xFFFFFFFF
+        x ^= x >> 15
+        return x & 0xFFFFFFFF
+
+    def feistel32(x, k):
+        l = x & 0xFFFF
+        r = (x >> 16) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def inv_feistel32(x, k):
+        l = x & 0xFFFF
+        r = (x >> 16) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def mba_add32(a, b, salt):
+        s = a & 0xFFFFFFFF
+        c = b & 0xFFFFFFFF
+        for _ in range(32):
+            ns = (s ^ c) & 0xFFFFFFFF
+            c = ((s & c) << 1) & 0xFFFFFFFF
+            s = ns
+        return inv_feistel32(feistel32(s, salt), salt)
+
+    def mba_xor32(a, b, salt):
+        ma = fbox32(salt, 0xA0761D64)
+        mb = fbox32(salt ^ 0xE7037ED1, 0x8EBC6AF1)
+        t = (inv_mds32(mds32((a ^ ma) & 0xFFFFFFFF) ^ mds32((b ^ mb) & 0xFFFFFFFF)) ^ ma ^ mb) & 0xFFFFFFFF
+        return inv_feistel32(feistel32(t, ma ^ mb), ma ^ mb)
+
+    def ch32(x, y, z, salt):
+        yy = mba_xor32(y, (salt * 0x01010101) & 0xFFFFFFFF, salt ^ 0xB492B66F)
+        zz = mba_xor32(z, rol32(salt, 7), salt ^ 0x9E3779B9)
+        out = ((x & yy) ^ ((~x & 0xFFFFFFFF) & zz)) & 0xFFFFFFFF
+        return mba_xor32(out, ((salt ^ rol32(x, 3)) * 0x45D9F3B) & 0xFFFFFFFF, salt ^ 0x6A09E667)
+
+    def maj32(x, y, z, salt):
+        a = mba_xor32(x, rol32(salt, 11), salt ^ 0xBB67AE85)
+        b = mba_xor32(y, (salt * 0x9E3779B1) & 0xFFFFFFFF, salt ^ 0x3C6EF372)
+        c = mba_xor32(z, rol32(salt ^ x, 19), salt ^ 0xA54FF53A)
+        out = ((a & b) ^ (a & c) ^ (b & c)) & 0xFFFFFFFF
+        return inv_mds32(mds32(out))
+
+    def poly32(x, y, z, salt):
+        p = mba_add32(mba_xor32(x, rol32(y, 5), salt ^ 0x510E527F),
+                      ((z | 1) * (salt | 1)) & 0xFFFFFFFF,
+                      salt ^ 0x9B05688C)
+        q = ((p & rol32(x, 11)) ^ ((~p & 0xFFFFFFFF) & rol32(mba_xor32(y, z, salt ^ 0x1F83D9AB), 17))) & 0xFFFFFFFF
+        q = mba_add32(q, (mba_xor32(x, z, salt ^ 0x5BE0CD19) * 0x119DE1F3) & 0xFFFFFFFF,
+                      salt ^ 0xC3A5C85C)
+        return inv_feistel32(feistel32(q, salt ^ p), salt ^ p)
+
+    def trunc8(x):
+        return x & 0xFF
+
+    def xor8(a, b, salt=0):
+        return (a ^ b) & 0xFF
+
+    def sub8(a, b, salt=0):
+        return (a - b) & 0xFF
+
+    def project_byte(x, lane, salt):
+        shifted = (x >> ((lane & 3) * 8)) & 0xFFFFFFFF
+        carrier = (shifted ^ (fbox32(salt ^ shifted, 0x589965CC) & 0xFFFFFF00)) & 0xFFFFFFFF
+        return trunc8(carrier)
+
+    def compress_lane32(x, y, z, salt, rnd):
+        lanes = [0, 0, 0, 0]
+        carry = mba_xor32(rol32(x, (rnd + 3) & 31), y ^ salt, salt ^ 0xB492B66F)
+        for i in range(4):
+            xb = project_byte(x, i, salt ^ ((i * 0x45D9F3B) & 0xFFFFFFFF))
+            yb = project_byte(y, i + 1, salt ^ ((i * 0x119DE1F3) & 0xFFFFFFFF))
+            zb = project_byte(z, i + 2, salt ^ ((i * 0x9E3779B1) & 0xFFFFFFFF))
+            cb = project_byte(carry, i, salt ^ ((i * 0x6D2B79F5) & 0xFFFFFFFF))
+
+            sum32 = mba_add32(xb, xor8(yb, cb), salt ^ ((i * 0x2545F491) & 0xFFFFFFFF))
+            sm = trunc8(sum32)
+            tail = trunc8(zb + rnd * 0x11 + i)
+            diff = sub8(sm, tail)
+            rc = (xb ^ zb ^ cb ^ (salt & 0xFF) ^ (rnd & 0xFF)) & 7
+            rot = rol8(diff, rc)
+
+            gate = ch32(x ^ carry,
+                        y ^ rol32(salt, i + 1),
+                        z ^ rol32(carry, i + 3),
+                        salt ^ 0x27D4EB2F ^ i)
+            gate_lane = project_byte(gate, i, salt ^ 0x85EBCA77)
+            out_lane = xor8(rot, gate_lane)
+            pos = (i * 3 + rnd) & 3
+            lanes[pos] = out_lane
+
+            lane_word = (out_lane << ((pos & 3) * 8)) & 0xFFFFFFFF
+            carry = mba_add32(carry ^ lane_word,
+                              sum32 ^ ((zb << (((3 - i) & 3) * 8)) & 0xFFFFFFFF),
+                              salt ^ 0x8EBC6AF1 ^ ((i * 0x3D) & 0xFFFFFFFF))
+            carry = rol32(carry, (rc + i + 1) & 31)
+
+        packed = lanes[0] | (lanes[1] << 8) | (lanes[2] << 16) | (lanes[3] << 24)
+        mixed = mds32((packed ^ salt) & 0xFFFFFFFF)
+        mixed = mba_xor32(mixed,
+                          rol32(carry, ((x ^ y ^ salt) & 7) + 5),
+                          salt ^ 0x510E527F)
+        return inv_feistel32(feistel32(mixed, carry ^ salt), carry ^ salt)
+
+    a = mba_xor32(struct.unpack_from("<I", material, 8)[0],
+                  struct.unpack_from("<I", soKey, 0)[0] ^ rol32(lane_ctx, 5),
+                  0xD1B54A32)
+    b = mba_xor32(struct.unpack_from("<I", material, 12)[0],
+                  struct.unpack_from("<I", soKey, 4)[0] ^ rol32(lane_ctx, 13),
+                  0x94D049BB)
+    c = mba_xor32(struct.unpack_from("<I", material, 0)[0],
+                  struct.unpack_from("<I", seeds, 8)[0] ^ lane_ctx,
+                  0x2545F491)
+    d = mba_xor32(struct.unpack_from("<I", material, 4)[0],
+                  struct.unpack_from("<I", seeds, 12)[0] ^ rol32(lane_ctx, 21),
+                  0x9E3779B9)
+
+    for r in range(5):
+        sw = struct.unpack_from("<I", seeds, (r & 3) * 4)[0]
+        salt = (0x7E3A19C5 ^ (r * 0x45D9F3B) ^ (a_share * 0x01010101) ^ rol32(lane_ctx, r + 3)) & 0xFFFFFFFF
+        lane = compress_lane32(a ^ sw, b, c ^ d, salt, r)
+        ch = ch32(a ^ sw, b, c, salt ^ 0xD6E8FEB8)
+        maj = maj32(a, c ^ sw, d, salt ^ 0xC2B2AE35)
+        poly = poly32(b ^ sw, (c + salt + lane) & 0xFFFFFFFF, d ^ a_share, salt ^ 0x165667B1)
+        f = fbox32(mba_xor32(b ^ ch ^ lane, rol32(c ^ maj, r + 3), salt),
+                   mba_xor32(sw ^ poly, d ^ rol32(lane, r + 1), salt ^ 0xA0761D64))
+        g = mds32(mba_xor32(a ^ maj, f ^ poly ^ lane, salt ^ 0xE7037ED1))
+        feed = (((a ^ lane) & rol32(b, r + 5)) ^
+                ((~b & 0xFFFFFFFF) & rol32(c ^ d ^ ch ^ lane, r + 1))) & 0xFFFFFFFF
+        a = rol32(mba_add32(a ^ lane,
+                            mba_xor32(g, feed, salt ^ 0x8EBC6AF1),
+                            salt ^ 0xD6E8FEB8),
+                  5 + ((r ^ lane) & 7))
+        b = (mba_xor32(rol32(mba_add32(b, ((a * (0x9E3779B1 + r * 2)) & 0xFFFFFFFF) ^ lane,
+                                          salt ^ 0xC2B2AE35),
+                              11 + ((r + (lane >> 3)) & 15)),
+                       inv_mds32(g) ^ ch ^ compress_lane32(lane, c, d, salt ^ g, r + 3),
+                       salt ^ 0x165667B1)) & 0xFFFFFFFF
+        c = mba_add32(c ^ rol32(a ^ poly ^ lane, r + 7),
+                      b ^ sw ^ maj,
+                      salt ^ 0x85EBCA77)
+        d = rol32((d + mba_xor32(c ^ ch, (a ^ lane) >> ((r & 7) + 1), salt ^ 0x27D4EB2F)) & 0xFFFFFFFF,
+                  3 + ((r * 5 + (lane & 7)) & 15))
+        lane_ctx = mba_add32(lane_ctx ^ lane,
+                             compress_lane32(a, b ^ c, d, salt ^ lane, r + 7),
+                             salt ^ 0x589965CC)
+
+    x = mba_xor32(a, rol32(b, 13), 0x6A09E667)
+    x = mba_add32(x, mba_xor32(c, rol32(d, 19), 0xBB67AE85), 0x3C6EF372)
+    x = mba_xor32(x, ((a_share * 0x01020408) & 0xFFFFFFFF) ^ lane_ctx, 0xA54FF53A)
+    return inv_feistel32(feistel32(x, x ^ struct.unpack_from("<I", soKey, 8)[0]),
+                         x ^ struct.unpack_from("<I", soKey, 8)[0])
+
+def derive_lane_context(material, encoded_head, seeds, soKey, a_share):
+    def mds32(x):
+        def gf_mul(a, b):
+            r = 0
+            for _ in range(8):
+                if b & 1:
+                    r ^= a
+                hi = a & 0x80
+                a = (a << 1) & 0xFF
+                if hi:
+                    a ^= 0x1B
+                b >>= 1
+            return r & 0xFF
+        a0 = x & 0xFF
+        a1 = (x >> 8) & 0xFF
+        a2 = (x >> 16) & 0xFF
+        a3 = (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 2) ^ gf_mul(a1, 3) ^ a2 ^ a3
+        b1 = a0 ^ gf_mul(a1, 2) ^ gf_mul(a2, 3) ^ a3
+        b2 = a0 ^ a1 ^ gf_mul(a2, 2) ^ gf_mul(a3, 3)
+        b3 = gf_mul(a0, 3) ^ a1 ^ a2 ^ gf_mul(a3, 2)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def inv_mds32(x):
+        def gf_mul(a, b):
+            r = 0
+            for _ in range(8):
+                if b & 1:
+                    r ^= a
+                hi = a & 0x80
+                a = (a << 1) & 0xFF
+                if hi:
+                    a ^= 0x1B
+                b >>= 1
+            return r & 0xFF
+        a0 = x & 0xFF
+        a1 = (x >> 8) & 0xFF
+        a2 = (x >> 16) & 0xFF
+        a3 = (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 0x0E) ^ gf_mul(a1, 0x0B) ^ gf_mul(a2, 0x0D) ^ gf_mul(a3, 0x09)
+        b1 = gf_mul(a0, 0x09) ^ gf_mul(a1, 0x0E) ^ gf_mul(a2, 0x0B) ^ gf_mul(a3, 0x0D)
+        b2 = gf_mul(a0, 0x0D) ^ gf_mul(a1, 0x09) ^ gf_mul(a2, 0x0E) ^ gf_mul(a3, 0x0B)
+        b3 = gf_mul(a0, 0x0B) ^ gf_mul(a1, 0x0D) ^ gf_mul(a2, 0x09) ^ gf_mul(a3, 0x0E)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def fbox32(x, k):
+        x = (x ^ k) & 0xFFFFFFFF
+        x = (x * 0x45D9F3B) & 0xFFFFFFFF
+        x ^= x >> 16
+        x = (x * 0x119DE1F3) & 0xFFFFFFFF
+        x ^= x >> 15
+        return x & 0xFFFFFFFF
+
+    def feistel32(x, k):
+        l = x & 0xFFFF
+        r = (x >> 16) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def inv_feistel32(x, k):
+        l = x & 0xFFFF
+        r = (x >> 16) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def mba_add32(a, b, salt):
+        s = a & 0xFFFFFFFF
+        c = b & 0xFFFFFFFF
+        for _ in range(32):
+            ns = (s ^ c) & 0xFFFFFFFF
+            c = ((s & c) << 1) & 0xFFFFFFFF
+            s = ns
+        return inv_feistel32(feistel32(s, salt), salt)
+
+    def mba_xor32(a, b, salt):
+        ma = fbox32(salt, 0xA0761D64)
+        mb = fbox32(salt ^ 0xE7037ED1, 0x8EBC6AF1)
+        t = (inv_mds32(mds32((a ^ ma) & 0xFFFFFFFF) ^ mds32((b ^ mb) & 0xFFFFFFFF)) ^ ma ^ mb) & 0xFFFFFFFF
+        return inv_feistel32(feistel32(t, ma ^ mb), ma ^ mb)
+
+    def ch32(x, y, z, salt):
+        yy = mba_xor32(y, (salt * 0x01010101) & 0xFFFFFFFF, salt ^ 0xB492B66F)
+        zz = mba_xor32(z, rol32(salt, 7), salt ^ 0x9E3779B9)
+        out = ((x & yy) ^ ((~x & 0xFFFFFFFF) & zz)) & 0xFFFFFFFF
+        return mba_xor32(out, ((salt ^ rol32(x, 3)) * 0x45D9F3B) & 0xFFFFFFFF, salt ^ 0x6A09E667)
+
+    def project_byte(x, lane, salt):
+        shifted = (x >> ((lane & 3) * 8)) & 0xFFFFFFFF
+        carrier = (shifted ^ (fbox32(salt ^ shifted, 0x589965CC) & 0xFFFFFF00)) & 0xFFFFFFFF
+        return carrier & 0xFF
+
+    def compress_lane32(x, y, z, salt, rnd):
+        lanes = [0, 0, 0, 0]
+        carry = mba_xor32(rol32(x, (rnd + 3) & 31), y ^ salt, salt ^ 0xB492B66F)
+        for i in range(4):
+            xb = project_byte(x, i, salt ^ ((i * 0x45D9F3B) & 0xFFFFFFFF))
+            yb = project_byte(y, i + 1, salt ^ ((i * 0x119DE1F3) & 0xFFFFFFFF))
+            zb = project_byte(z, i + 2, salt ^ ((i * 0x9E3779B1) & 0xFFFFFFFF))
+            cb = project_byte(carry, i, salt ^ ((i * 0x6D2B79F5) & 0xFFFFFFFF))
+
+            sum32 = mba_add32(xb, (yb ^ cb) & 0xFF, salt ^ ((i * 0x2545F491) & 0xFFFFFFFF))
+            sm = sum32 & 0xFF
+            tail = (zb + rnd * 0x11 + i) & 0xFF
+            diff = (sm - tail) & 0xFF
+            rc = (xb ^ zb ^ cb ^ (salt & 0xFF) ^ (rnd & 0xFF)) & 7
+            rot = rol8(diff, rc)
+
+            gate = ch32(x ^ carry,
+                        y ^ rol32(salt, i + 1),
+                        z ^ rol32(carry, i + 3),
+                        salt ^ 0x27D4EB2F ^ i)
+            gate_lane = project_byte(gate, i, salt ^ 0x85EBCA77)
+            out_lane = (rot ^ gate_lane) & 0xFF
+            pos = (i * 3 + rnd) & 3
+            lanes[pos] = out_lane
+
+            lane_word = (out_lane << ((pos & 3) * 8)) & 0xFFFFFFFF
+            carry = mba_add32(carry ^ lane_word,
+                              sum32 ^ ((zb << (((3 - i) & 3) * 8)) & 0xFFFFFFFF),
+                              salt ^ 0x8EBC6AF1 ^ ((i * 0x3D) & 0xFFFFFFFF))
+            carry = rol32(carry, (rc + i + 1) & 31)
+
+        packed = lanes[0] | (lanes[1] << 8) | (lanes[2] << 16) | (lanes[3] << 24)
+        mixed = mds32((packed ^ salt) & 0xFFFFFFFF)
+        mixed = mba_xor32(mixed,
+                          rol32(carry, ((x ^ y ^ salt) & 7) + 5),
+                          salt ^ 0x510E527F)
+        return inv_feistel32(feistel32(mixed, carry ^ salt), carry ^ salt)
+
+    ctx = mba_xor32(struct.unpack_from("<I", material, 8)[0],
+                    rol32(struct.unpack_from("<I", material, 12)[0], 7),
+                    0xD6E8FEB8)
+    ctx = mba_xor32(ctx,
+                    struct.unpack_from("<I", seeds, 0)[0] ^ ((a_share * 0x01010101) & 0xFFFFFFFF),
+                    0xA0761D64)
+
+    for i in range(8):
+        salt = (0x3A5C742E ^ (i * 0x45D9F3B) ^ rol32(ctx, i + 1)) & 0xFFFFFFFF
+        hidden = material[8 + i]
+        enc = encoded_head[(i * 5 + 1) & 7]
+        seed_lane = seeds[(i * 3 + 2) & 0x0F]
+        key_lane = soKey[(i * 7 + 4) & 0x0F]
+        ctx_lane = (ctx >> ((i & 3) * 8)) & 0xFF
+
+        braid = hidden ^ enc
+        braid = (braid - (seed_lane ^ key_lane)) & 0xFF
+        braid = (braid + (ctx_lane ^ a_share)) & 0xFF
+        rc = (braid ^ hidden ^ seed_lane ^ ctx_lane) & 7
+        braid = rol8(braid, rc)
+
+        fold = compress_lane32(struct.unpack_from("<I", material, 8)[0],
+                               struct.unpack_from("<I", material, 0)[0],
+                               struct.unpack_from("<I", seeds, (i & 3) * 4)[0],
+                               salt ^ braid,
+                               i + 1)
+        lane_word = (braid << ((i & 3) * 8)) & 0xFFFFFFFF
+        ctx = mba_add32(ctx ^ lane_word,
+                        fold ^ ((enc * 0x01010101) & 0xFFFFFFFF),
+                        salt ^ 0x8EBC6AF1)
+        ctx = rol32(ctx, (rc + i + 5) & 31)
+
+    tail = compress_lane32(struct.unpack_from("<I", material, 12)[0],
+                           struct.unpack_from("<I", seeds, 4)[0],
+                           struct.unpack_from("<I", soKey, 0)[0],
+                           ctx ^ 0xB492B66F,
+                           9)
+    return mba_xor32(ctx, tail, 0x6A09E667)
+
+
+def derive_material_lane_hint_mask(material, seeds, soKey, a_share, lane_ctx):
+    x = ((struct.unpack_from("<I", seeds, 8)[0] << 32) |
+         struct.unpack_from("<I", soKey, 4)[0])
+    x ^= ((struct.unpack_from("<I", seeds, 0)[0] << 9) |
+          (struct.unpack_from("<I", soKey, 0)[0] >> 3))
+    x ^= struct.unpack_from("<I", material, 0)[0] << 16
+    x ^= struct.unpack_from("<I", material, 4)[0] << 1
+    x ^= ((lane_ctx * 0x9E3779B185EBCA87) & ((1 << 64) - 1))
+    x ^= ((a_share * 0x0101010101010101) & ((1 << 64) - 1))
+    x &= (1 << 64) - 1
+    x ^= x >> 33
+    x = (x * 0xFF51AFD7ED558CCD) & ((1 << 64) - 1)
+    x ^= x >> 33
+    x = (x * 0xC4CEB9FE1A85EC53) & ((1 << 64) - 1)
+    x ^= x >> 33
+    return x & ((1 << 64) - 1)
+
+
+def derive_material_lane_hint(material, seeds, soKey, a_share, lane_ctx):
+    lane = struct.unpack_from("<Q", material, 8)[0]
+    mask = derive_material_lane_hint_mask(material, seeds, soKey, a_share, lane_ctx)
+    out = 0
+    for i in range(46):
+        p0 = (i * 7 + 3) & 63
+        p1 = (i * 11 + 19) & 63
+        p2 = (i * 17 + 5) & 63
+        p3 = (i * 23 + 29) & 63
+        p4 = (p0 + p2 + i) & 63
+        m0 = (i * 5 + 1) & 63
+        m1 = (i * 9 + 13) & 63
+        m2 = (i * 27 + 31) & 63
+        a = ((lane >> p0) ^ (lane >> p1) ^ (mask >> m0) ^ (i * 0xA5 + 0x3D)) & 1
+        b = ((lane >> p2) ^ (mask >> m1) ^ (i * 0x3B + 0x71)) & 1
+        c = ((lane >> p3) ^ (lane >> p4) ^ (mask >> m2) ^ (i * 0x6D + 0x2F)) & 1
+        bit = a ^ (b & c)
+        out |= bit << i
+    return out & ((1 << 46) - 1)
+
+def encode_oracle_material_head(material, seeds, soKey, a_share):
+    fb = (a_share ^ soKey[2]) & 0xFF
+    out = bytearray(8)
+    for i in range(8):
+        x = material[i] ^ seeds[(i * 5 + 3) & 0x0F]
+        x ^= soKey[(i * 7 + 9) & 0x0F]
+        add = (a_share + ((i * 0x2D + fb) & 0xFF)) & 0xFF
+        x = (x + add) & 0xFF
+        lane = rol8((seeds[(i + 11) & 0x0F] + fb) & 0xFF, i + 1)
+        out[i] = x ^ lane
+        fb = (out[i] ^ ((material[(i + 3) & 7] + 0x5A + i) & 0xFF)) & 0xFF
+    return bytes(out)
+
+def derive_scheme_a_share_raw(flag_a, bb_addrs, rc, sbox):
+    rc_high4 = (rc[0] >> 28) & 0xF
+    step3_bits = 16 + rc_high4
+    step2_amount = flag_a[21] & 0x1F
+    raw = flag_a[22] | (flag_a[23] << 8) | (flag_a[24] << 16)
+    mask = (1 << step3_bits) - 1 if step3_bits < 32 else 0xFFFFFFFF
+    step3_param = raw & mask
+    dispatch0 = bb_addrs["BB6_ADR_OFF"]
+    x = (dispatch0 ^ rc[0] ^ step3_param) & 0xFFFFFFFF
+    x ^= (((step2_amount << 24) & 0xFFFFFFFF) ^ ((sbox[0] * 0x01010101) & 0xFFFFFFFF))
+    x &= 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x45D9F3B) & 0xFFFFFFFF
+    x ^= x >> 15
+    return (x ^ (x >> 8)) & 0xFF
+
+
+def derive_scheme_a_share(flag_a, bb_addrs, rc, sbox):
+    return derive_scheme_a_share_raw(flag_a, bb_addrs, rc, sbox) ^ SCHEME_A_SHARE_TUNE
+
+def compute_enc_expected_a(flag_bytes, soKey, bb_addrs, rc, sbox, material_share=0):
     """Forward-simulate scheme A to compute ENC_EXPECTED_STATE_A."""
     xtea_delta = struct.unpack_from("<I", flag_bytes, 13)[0]
     rc_high4 = (rc[0] >> 28) & 0xF
@@ -907,10 +1535,11 @@ def compute_enc_expected_a(flag_bytes, soKey, bb_addrs, rc, sbox):
     final = bytes(
         struct.pack("<IIII", v0, v1, v2, v3)
     )
-    return bytes(final[i] ^ soKey[i] for i in range(16))
+    plain = bytes(final[i] ^ soKey[i] for i in range(16))
+    return apply_cross_mask(plain, material_share, 0xA1)
 
 
-def compute_enc_expected_b(flag_bytes, soKey, expected_check, iv=None):
+def compute_enc_expected_b(flag_bytes, soKey, expected_check, iv=None, a_share=0, domain=0xB1):
     """Forward-simulate scheme B to compute ENC_EXPECTED_STATE."""
     if iv is None:
         iv = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
@@ -1010,7 +1639,8 @@ def compute_enc_expected_b(flag_bytes, soKey, expected_check, iv=None):
         state = [state[i] ^ k[i % 4] for i in range(16)]
 
     final = bytes(state)
-    return bytes(final[i] ^ soKey[i] for i in range(16))
+    plain = bytes(final[i] ^ soKey[i] for i in range(16))
+    return apply_cross_mask(plain, a_share, domain)
 
 
 # ── 步骤 6: 组装 flag ────────────────────────────────────────────
@@ -1070,6 +1700,100 @@ def build_flag(soKey, bb_addrs):
     return bytes(flag)
 
 
+FLAG_A_PERM = [
+    7, 2, 19, 0, 14, 23, 5, 11, 21, 3, 17, 8, 24,
+    1, 12, 6, 20, 10, 4, 22, 15, 9, 18, 13, 16,
+]
+
+
+def rol8(x, n):
+    n &= 7
+    x &= 0xFF
+    return x if n == 0 else (((x << n) | (x >> (8 - n))) & 0xFF)
+
+
+def encode_flag_a(plain, soKey):
+    if len(plain) != 25:
+        raise ValueError("flagA plain length must be 25")
+    out = bytearray(25)
+    prev = soKey[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + soKey[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[j] = ((plain[i] ^ soKey[(i * 5 + 3) & 0x0F]) + mix) & 0xFF
+        prev = ((plain[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
+
+def decode_flag_a(encoded, soKey):
+    if len(encoded) != 25:
+        raise ValueError("flagA encoded length must be 25")
+    out = bytearray(25)
+    prev = soKey[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + soKey[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[i] = ((encoded[j] - mix) & 0xFF) ^ soKey[(i * 5 + 3) & 0x0F]
+        prev = ((out[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
+
+def material_generated_mask32_py(slot):
+    slot &= 0xFFFFFFFF
+    x = (0x6D46A001 ^ ((slot * 0x9E3779B9) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    x ^= (0x85EBCA77 + ((slot * 0x27D4EB2F) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    x &= 0xFFFFFFFF
+    for i in range(5):
+        t = (0xC3A5C85C + ((slot * 0x165667B1) & 0xFFFFFFFF) + ((i * 0x7F4A7C15) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        t = (t ^ (t >> 13)) & 0xFFFFFFFF
+        t = (t * 0x9E3779B9) & 0xFFFFFFFF
+        t = (t ^ (t >> 16)) & 0xFFFFFFFF
+        x ^= rol32(t, (slot + i * 3 + 5) & 31)
+        x &= 0xFFFFFFFF
+        x = (x ^ (x >> 15)) & 0xFFFFFFFF
+        x = (x * 0x2C1B3C6D) & 0xFFFFFFFF
+        x = (x ^ (x >> 12)) & 0xFFFFFFFF
+        x = (x * 0x297A2D39) & 0xFFFFFFFF
+        x = rol32(x, ((slot + 1) * 5 + i * 7) & 31)
+    return (x ^ 0xB492B66F) & 0xFFFFFFFF
+
+
+def material_generated_mask8_py(slot):
+    x = material_generated_mask32_py(slot) ^ rol32(material_generated_mask32_py(slot + 5), 11)
+    return (x ^ (x >> 8) ^ (x >> 16) ^ (x >> 24)) & 0xFF
+
+
+def material_shard_static_mask8_py(pos):
+    x = (0xB7E15163 ^ ((pos * 0x9E3779B9) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    x ^= rol32((0x243F6A88 + ((pos * 0x85EBCA77) & 0xFFFFFFFF)) & 0xFFFFFFFF,
+               (pos * 5 + 3) & 31)
+    x &= 0xFFFFFFFF
+    x = (x ^ (x >> 16)) & 0xFFFFFFFF
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x = (x ^ (x >> 15)) & 0xFFFFFFFF
+    x = (x * 0x846CA68B) & 0xFFFFFFFF
+    x = (x ^ (x >> 16)) & 0xFFFFFFFF
+    return (x ^ (x >> 8) ^ (x >> 19)) & 0xFF
+
+
+def material_shard_tables(material_shards):
+    route = [17, 3, 23, 8, 1, 26, 12, 20, 5, 15, 28, 10]
+    bank = [
+        0x31, 0x62, 0xA7, 0x18, 0xDB, 0x4C, 0x90, 0xE5,
+        0x2B, 0x77, 0x09, 0xF4, 0xC2, 0x6D, 0x55, 0x8E,
+        0x13, 0xAA, 0x40, 0xBE, 0x21, 0xD9, 0x73, 0x0F,
+        0x96, 0x5B, 0xCD, 0x84, 0x39, 0xEF, 0x02,
+    ]
+    shard_bytes = bytearray()
+    for value in material_shards:
+        shard_bytes += struct.pack("<I", value & 0xFFFFFFFF)
+    route_enc = []
+    for pos, value in enumerate(shard_bytes):
+        bank[route[pos]] = value ^ material_shard_static_mask8_py(pos)
+        route_enc.append(route[pos] ^ ((0x5A + pos * 0x13) & 0xFF))
+    return bytes(bank), bytes(route_enc)
+
+
 # ── 步骤 7: 更新源文件 ───────────────────────────────────────────
 def update_file(path, old, new, multiline=False):
     """Replace old→new in file. Return True if changed."""
@@ -1095,7 +1819,29 @@ def fmt_hex_row(data):
     return ", ".join(parts[:8]) + ",\n    " + ", ".join(parts[8:])
 
 
-def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc, flag_b64_a, sbox_check, bb_addrs=None, so_path=None):
+def fmt_hex_rows(data, width=8):
+    parts = [f"0x{b:02X}" for b in data]
+    return ",\n    ".join(", ".join(parts[i:i + width]) for i in range(0, len(parts), width))
+
+
+def split_expected_enc(enc, domain):
+    s1 = bytes(((domain * 0x5D + i * 0x71 + 0xA5) & 0xFF) for i in range(16))
+    s0 = bytearray(16)
+    for i in range(16):
+        lane = rol8(s1[(i * 7 + 3) & 0x0F], i + domain)
+        s0[i] = enc[i] ^ lane ^ ((domain + i * 0x31) & 0xFF)
+    return bytes(s0), s1
+
+
+def split_array_decl(name, data):
+    return f"static volatile const uint8_t {name}[STATE_LEN] = {{\n    {fmt_hex_row(data)}\n}};"
+
+
+def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK,
+                     EXPECTED_MATERIAL_MID_TAG, EXPECTED_FAKE_SYNDROME,
+                     EXPECTED_MATERIAL_LANE_HINT,
+                     crc, flag_b64_a, sbox_check,
+                     bb_addrs=None, so_path=None, scheme_a_share_tune=0):
     """Write all computed constants back to source files (XOR-encrypted)."""
     # Compute XOR key for constant protection (fixed derivation, no .so dependency)
     cx_key = compute_const_xor_key()
@@ -1103,9 +1849,9 @@ def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc,
     enc_a_enc = xor_encrypt_bytes(enc_a, cx_key)
     enc_b_enc = xor_encrypt_bytes(enc_b, cx_key)
     enc_b2_enc = xor_encrypt_bytes(enc_b2, cx_key)
-    enc_a_str = fmt_hex_row(enc_a_enc)
-    enc_b_str = fmt_hex_row(enc_b_enc)
-    enc_b2_str = fmt_hex_row(enc_b2_enc)
+    enc_a_s0, enc_a_s1 = split_expected_enc(enc_a_enc, 0xA7)
+    enc_b_s0, enc_b_s1 = split_expected_enc(enc_b_enc, 0xB3)
+    enc_b2_s0, enc_b2_s1 = split_expected_enc(enc_b2_enc, 0xC5)
 
     changes = 0
 
@@ -1141,37 +1887,90 @@ def update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT, EXPECTED_SOKEY_CHECK, crc,
         changes += 1
         log(f"  update key_expand.c (EXPECTED_SOKEY_CHECK_ENC={expected_enc:#010x}u)")
 
-    # --- jni_entry.c: ENC_EXPECTED_STATE_ENC arrays (XOR encrypted) ---
+    # --- jni_entry.c: material mid tag + expected-state shards ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/jni_entry.c")
     with open(src, "r", encoding="utf-8") as f:
         content = f.read()
-
-    # Update ENC_EXPECTED_STATE_ENC (scheme B, first)
-    new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
-        lambda m: m.group(1) + "\n    " + enc_b_str + "\n" + m.group(2),
-        content, count=1
+    new_content = content
+    mid_tag_enc = xor_encrypt_u32(EXPECTED_MATERIAL_MID_TAG, cx_key, 0)
+    fake_syndrome_enc = EXPECTED_FAKE_SYNDROME ^ cx_key[0]
+    lane_hint_lo_enc = (EXPECTED_MATERIAL_LANE_HINT & 0xFFFFFFFF) ^ struct.unpack_from("<I", cx_key, 4)[0]
+    lane_hint_hi_enc = ((EXPECTED_MATERIAL_LANE_HINT >> 32) & 0xFFFFFFFF) ^ struct.unpack_from("<I", cx_key, 8)[0]
+    material_shards = [
+        mid_tag_enc ^ material_generated_mask32_py(0),
+        lane_hint_lo_enc ^ material_generated_mask32_py(1),
+        lane_hint_hi_enc ^ material_generated_mask32_py(2),
+    ]
+    material_bank, material_route = material_shard_tables(material_shards)
+    new_material_bank = (
+        "static volatile const uint8_t MATERIAL_SHARD_BANK[31] = {\n"
+        f"    {fmt_hex_rows(material_bank, 8)}\n"
+        "};"
     )
-
-    # Update ENC_EXPECTED_STATE_A_ENC (scheme A)
-    new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE_A_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
-        lambda m: m.group(1) + "\n    " + enc_a_str + "\n" + m.group(2),
-        new_content, count=1
+    new_material_route = (
+        "static volatile const uint8_t MATERIAL_SHARD_ROUTE[12] = {\n"
+        f"    {fmt_hex_rows(material_route, 6)}\n"
+        "};"
     )
-
-    # Update ENC_EXPECTED_STATE2_ENC (scheme B, second)
     new_content = re.sub(
-        r"(volatile const uint8_t ENC_EXPECTED_STATE2_ENC\[STATE_LEN\] = \{)\s*\n\s*[^\n]+\n\s*[^\n]+\n(\s*\};)",
-        lambda m: m.group(1) + "\n    " + enc_b2_str + "\n" + m.group(2),
-        new_content, count=1
+        r"static volatile const uint8_t MATERIAL_SHARD_BANK\[31\] = \{[^;]+;",
+        new_material_bank,
+        new_content,
+        flags=re.DOTALL,
     )
-
+    new_content = re.sub(
+        r"static volatile const uint8_t MATERIAL_SHARD_ROUTE\[12\] = \{[^;]+;",
+        new_material_route,
+        new_content,
+        flags=re.DOTALL,
+    )
+    fake_syndrome_shard = fake_syndrome_enc ^ material_generated_mask8_py(3)
+    new_content = re.sub(
+        r"MATERIAL_FAKE_SYNDROME_SHARD = 0x[0-9a-fA-F]+u;",
+        f"MATERIAL_FAKE_SYNDROME_SHARD = {fake_syndrome_shard:#04x}u;",
+        new_content,
+    )
+    new_content = re.sub(
+        r"SCHEME_A_SHARE_TUNE = 0x[0-9a-fA-F]+u;",
+        f"SCHEME_A_SHARE_TUNE = {scheme_a_share_tune & 0xFF:#04x}u;",
+        new_content,
+    )
+    shard_updates = {
+        "ENC_EXPECTED_STATE_S0": enc_b_s0,
+        "ENC_EXPECTED_STATE_S1": enc_b_s1,
+        "ENC_EXPECTED_STATE_A_S0": enc_a_s0,
+        "ENC_EXPECTED_STATE_A_S1": enc_a_s1,
+        "ENC_EXPECTED_STATE2_S0": enc_b2_s0,
+        "ENC_EXPECTED_STATE2_S1": enc_b2_s1,
+    }
+    for name, data in shard_updates.items():
+        new_content = re.sub(
+            rf"static volatile const uint8_t {name}\[STATE_LEN\] = \{{[^;]+;",
+            split_array_decl(name, data),
+            new_content,
+            flags=re.DOTALL,
+        )
     if new_content != content:
         with open(src, "w", encoding="utf-8") as f:
             f.write(new_content)
         changes += 1
-        log(f"  update jni_entry.c (ENC arrays)")
+        log("  update jni_entry.c (expected shards)")
+
+    # --- converge.py: keep Python-side Scheme A share tune aligned with native ---
+    src = os.path.join(ROOT, "converge.py")
+    with open(src, "r", encoding="utf-8") as f:
+        content = f.read()
+    new_content = re.sub(
+        r"SCHEME_A_SHARE_TUNE = 0x[0-9a-fA-F]+",
+        f"SCHEME_A_SHARE_TUNE = {scheme_a_share_tune & 0xFF:#04x}",
+        content,
+        count=1,
+    )
+    if new_content != content:
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        changes += 1
+        log(f"  update converge.py (SCHEME_A_SHARE_TUNE={scheme_a_share_tune & 0xFF:#04x})")
 
     # --- repair_sbox.c: SBOX_CHECK_ENC (XOR encrypted) ---
     src = os.path.join(ROOT, "app/src/main/cpp/src/repair_sbox.c")
@@ -1233,21 +2032,25 @@ def verify_python(so_path, soKey, expected_sokey_check, enc_a, enc_b, enc_b2, bb
     """Run Python-side verification of both schemes."""
     flag_b = FLAG_B
     flag_a = build_flag(soKey, bb_addrs)
+    flag_a_encoded = encode_flag_a(flag_a, soKey)
+    assert decode_flag_a(flag_a_encoded, soKey) == flag_a
 
     log("Verifying scheme B...")
-    enc_out_b = compute_enc_expected_b(flag_b, soKey, expected_sokey_check)
+    material_share = derive_material_share(flag_b)
+    a_share = derive_scheme_a_share(build_flag(soKey, bb_addrs), bb_addrs, compute_kct_kout(build_flag(soKey, bb_addrs), soKey, bb_addrs)[2], compute_kct_kout(build_flag(soKey, bb_addrs), soKey, bb_addrs)[3])
+    enc_out_b = compute_enc_expected_b(flag_b, soKey, expected_sokey_check, a_share=a_share, domain=0xB1)
     ok_b = (enc_out_b == enc_b)
     log(f"  Scheme B correct flag (IV1): {'PASS' if ok_b else 'FAIL'}")
 
-    enc_out_b2 = compute_enc_expected_b(flag_b, soKey, expected_sokey_check, iv=IV2_B)
+    enc_out_b2 = compute_enc_expected_b(flag_b, soKey, expected_sokey_check, iv=IV2_B, a_share=a_share, domain=0xB2)
     ok_b2 = (enc_out_b2 == enc_b2)
     log(f"  Scheme B correct flag (IV2): {'PASS' if ok_b2 else 'FAIL'}")
 
-    enc_wrong = compute_enc_expected_b(b"\x00" * 25, soKey, expected_sokey_check)
+    enc_wrong = compute_enc_expected_b(b"\x00" * 25, soKey, expected_sokey_check, a_share=a_share, domain=0xB1)
     ok_bad = (enc_wrong != enc_b)
     log(f"  Scheme B wrong flag: {'PASS' if ok_bad else 'FAIL'}")
 
-    enc_bad_key = compute_enc_expected_b(flag_b, b"\x00" * 16, expected_sokey_check)
+    enc_bad_key = compute_enc_expected_b(flag_b, b"\x00" * 16, expected_sokey_check, a_share=a_share, domain=0xB1)
     ok_bk = (enc_bad_key != enc_b)
     log(f"  Scheme B wrong soKey: {'PASS' if ok_bk else 'FAIL'}")
 
@@ -1276,11 +2079,11 @@ def verify_python(so_path, soKey, expected_sokey_check, enc_a, enc_b, enc_b2, bb
         lcg = (lcg * 1664525 + 1013904223) & 0xFFFFFFFF
         rc.append(lcg)
 
-    enc_out_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox)
+    enc_out_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox, material_share)
     ok_a = (enc_out_a == enc_a)
     log(f"  Scheme A correct flag: {'PASS' if ok_a else 'FAIL'}")
 
-    enc_aw = compute_enc_expected_a(b"\x00" * 25, soKey, bb_addrs, rc, sbox)
+    enc_aw = compute_enc_expected_a(b"\x00" * 25, soKey, bb_addrs, rc, sbox, material_share)
     ok_aw = (enc_aw != enc_a)
     log(f"  Scheme A wrong flag: {'PASS' if ok_aw else 'FAIL'}")
 
@@ -1290,7 +2093,7 @@ def verify_python(so_path, soKey, expected_sokey_check, enc_a, enc_b, enc_b2, bb
     log("Verifying 50-byte interleaved flag...")
     inter = bytearray(50)
     for i in range(25):
-        inter[i * 2]     = flag_a[i]
+        inter[i * 2]     = flag_a_encoded[i]
         inter[i * 2 + 1] = flag_b[i]
     inter = bytes(inter)
     log(f"  Interleaved flag b64: {base64.b64encode(inter).decode()}")
@@ -1302,6 +2105,7 @@ def verify_python(so_path, soKey, expected_sokey_check, enc_a, enc_b, enc_b2, bb
 #  主流程
 # ═══════════════════════════════════════════════════════════════════
 def main():
+    global SCHEME_A_SHARE_TUNE
     log("=" * 50)
     log(f"Convergence ({BUILD_TYPE} build, max {args.max_iter} iterations)")
     log("=" * 50)
@@ -1344,23 +2148,39 @@ def main():
         log(f"  step3_bits = {step3_bits}")
         log(f"  SOKEY_CHECK = {EXPECTED_SOKEY_CHECK:#010x}")
 
-        enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox)
-        enc_b = compute_enc_expected_b(flag_b, soKey, EXPECTED_SOKEY_CHECK)
-        enc_b2 = compute_enc_expected_b(flag_b, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B)
+        material_share = derive_material_share(flag_b)
+        raw_a_share = derive_scheme_a_share_raw(flag_a, bb_addrs, rc, sbox)
+        scheme_a_share_tune = raw_a_share ^ TARGET_SCHEME_A_SHARE
+        SCHEME_A_SHARE_TUNE = scheme_a_share_tune
+        a_share = derive_scheme_a_share(flag_a, bb_addrs, rc, sbox)
+        log(f"  A_SHARE raw={raw_a_share:#04x} tune={scheme_a_share_tune:#04x} final={a_share:#04x}")
+        oracle_mat8_enc = encode_oracle_material_head(mat_b[:16], mat_b[80:96], soKey, a_share)
+        lane_ctx = derive_lane_context(mat_b[:16], oracle_mat8_enc, mat_b[80:96], soKey, a_share)
+        expected_mid_tag = derive_material_mid_tag(mat_b[:16], mat_b[80:96], soKey, a_share, lane_ctx)
+        expected_fake_syndrome = derive_fake_syndrome(flag_b, a_share, lane_ctx)
+        expected_lane_hint = derive_material_lane_hint(mat_b[:16], mat_b[80:96], soKey, a_share, lane_ctx)
+        enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox, material_share)
+        enc_b = compute_enc_expected_b(flag_b, soKey, EXPECTED_SOKEY_CHECK, a_share=a_share, domain=0xB1)
+        enc_b2 = compute_enc_expected_b(flag_b, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B, a_share=a_share, domain=0xB2)
         sbox_check = bytes(sbox[0:3])
         log(f"  ENC_A = {enc_a.hex()}")
         log(f"  ENC_B = {enc_b.hex()}")
         log(f"  ENC_B2 = {enc_b2.hex()}")
+        log(f"  MATERIAL_MID_TAG = {expected_mid_tag:#010x}")
+        log(f"  FAKE_SYNDROME = {expected_fake_syndrome:#04x}")
+        log(f"  MATERIAL_LANE_HINT = {expected_lane_hint:#015x}")
         log(f"  SBOX_CHECK = {sbox_check.hex()}")
 
         if args.dry_run:
             log("  [dry-run] skipping file update and rebuild")
             continue
 
+        flag_a_encoded = encode_flag_a(flag_a, soKey)
         changes = update_all_files(enc_a, enc_b, enc_b2, KCT, KOUT,
-                                   EXPECTED_SOKEY_CHECK, crc,
-                                   base64.b64encode(flag_a).decode(), sbox_check, bb_addrs,
-                                   so_path)
+                                   EXPECTED_SOKEY_CHECK, expected_mid_tag, expected_fake_syndrome,
+                                   expected_lane_hint, crc,
+                                   base64.b64encode(flag_a_encoded).decode(), sbox_check, bb_addrs,
+                                   so_path, scheme_a_share_tune)
         if changes == 0:
             log(f"  No file changes, converged")
             break
@@ -1381,6 +2201,8 @@ def main():
     bb_text_foff, bb_text_vaddr, bb_text_size = get_text_bounds(elf_data)
     bb_addrs = extract_bb_addrs(elf_data, bb_text_foff, bb_text_vaddr, bb_text_size, so_path)
     flag_a = build_flag(soKey, bb_addrs)
+    flag_a_encoded = encode_flag_a(flag_a, soKey)
+    assert decode_flag_a(flag_a_encoded, soKey) == flag_a
 
     _, _, rc, sbox, _, _ = compute_kct_kout(flag_a, soKey, bb_addrs)
     # EXPECTED_SOKEY_CHECK from flag_b (matches key_schedule in verify_scheme_b)
@@ -1388,24 +2210,41 @@ def main():
     rk15_b = struct.unpack_from("<I", mat_b, 60)[0]
     sokey_12 = struct.unpack_from("<I", soKey, 12)[0]
     EXPECTED_SOKEY_CHECK = rk15_b ^ sokey_12
-    enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox)
-    enc_b = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK)
-    enc_b2 = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B)
+    material_share = derive_material_share(FLAG_B)
+    raw_a_share = derive_scheme_a_share_raw(flag_a, bb_addrs, rc, sbox)
+    SCHEME_A_SHARE_TUNE = raw_a_share ^ TARGET_SCHEME_A_SHARE
+    a_share = derive_scheme_a_share(flag_a, bb_addrs, rc, sbox)
+    log(f"  Final A_SHARE raw={raw_a_share:#04x} tune={SCHEME_A_SHARE_TUNE:#04x} final={a_share:#04x}")
+    oracle_mat8_enc_for_ctx = encode_oracle_material_head(mat_b[:16], mat_b[80:96], soKey, a_share)
+    lane_ctx = derive_lane_context(mat_b[:16], oracle_mat8_enc_for_ctx, mat_b[80:96], soKey, a_share)
+    expected_mid_tag = derive_material_mid_tag(mat_b[:16], mat_b[80:96], soKey, a_share, lane_ctx)
+    enc_a = compute_enc_expected_a(flag_a, soKey, bb_addrs, rc, sbox, material_share)
+    enc_b = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK, a_share=a_share, domain=0xB1)
+    enc_b2 = compute_enc_expected_b(FLAG_B, soKey, EXPECTED_SOKEY_CHECK, iv=IV2_B, a_share=a_share, domain=0xB2)
 
     # ── Oracle shellcode 后处理：patch data + XOR encrypt ──────
     log("Patching oracle shellcode...")
-    # 计算正确的 oracle 数据: seeds[16] + material[0:8] + tag[8].
-    # 不暴露 material[8:16]，避免选手直接补齐 ARX 末态逆回 flag。
+    # 计算正确的 oracle 数据: seeds[16] + encoded material[0:8] + tag[8].
+    # 不暴露 material[8:16]，也不直接暴露 material 头部明文。
     full_mat = expand_key_material(FLAG_B, 96)
     oracle_seeds = full_mat[80:96]    # material[80:96] = seeds
     oracle_mat8 = full_mat[0:8]
+    oracle_mat8_enc = encode_oracle_material_head(full_mat[0:16], oracle_seeds, soKey, a_share)
+    lane_ctx = derive_lane_context(full_mat[0:16], oracle_mat8_enc, oracle_seeds, soKey, a_share)
+    material_lane_hint = derive_material_lane_hint(full_mat[0:16], oracle_seeds, soKey, a_share, lane_ctx)
     oracle_tag = bytes(
-        oracle_seeds[i] ^ oracle_seeds[8 + i] ^ soKey[(i + 5) & 0x0F] ^ ((0xC3 + i * 0x29) & 0xFF)
+        oracle_seeds[i] ^ oracle_seeds[8 + i] ^ soKey[(i + 5) & 0x0F] ^
+        ((0xC3 + i * 0x29) & 0xFF) ^ ((a_share + i * 0x17) & 0xFF) ^
+        ((lane_ctx >> ((i & 3) * 8)) & 0xFF)
         for i in range(8)
     )
-    oracle_data = oracle_seeds + oracle_mat8 + oracle_tag  # 32 bytes total
+    oracle_data = oracle_seeds + oracle_mat8_enc + oracle_tag  # 32 bytes total
     log(f"  seeds = {oracle_seeds.hex()}")
     log(f"  material[0:8] = {oracle_mat8.hex()}")
+    log(f"  material_mid_tag = {expected_mid_tag:#010x}")
+    log(f"  material_lane_ctx = {lane_ctx:#010x}")
+    log(f"  material_lane_hint = {material_lane_hint:#015x}")
+    log(f"  oracle material encoded = {oracle_mat8_enc.hex()}")
     log(f"  oracle tag = {oracle_tag.hex()}")
 
     # Patch 32 bytes 到 .so（明文状态）
@@ -1423,14 +2262,9 @@ def main():
         patched_so = f.read()
 
     # Strip the patched .so ourselves using llvm-strip
-    ndk = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-    strip_bin = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
-    if not os.path.isfile(strip_bin):
-        for ndk_dir in ["27.0.12077973", "26.3.11579264", "25.2.9519653"]:
-            ndk = os.path.expanduser(f"~/AppData/Local/Android/Sdk/ndk/{ndk_dir}")
-            strip_bin = f"{ndk}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
-            if os.path.isfile(strip_bin):
-                break
+    strip_bin = find_ndk_tool("llvm-strip")
+    if not strip_bin:
+        raise RuntimeError("llvm-strip not found")
 
     # Write patched .so to temp, strip it
     tmp_so = os.path.join(ROOT, "app/build/tmp_patched_kctf.so")
@@ -1441,26 +2275,41 @@ def main():
         stripped_patched = f.read()
     os.remove(tmp_so)
 
-    # Replace .so inside APK zip
+    # Replace .so inside APK zip and drop release metadata that is irrelevant to
+    # challenge semantics but leaks build/VCS details.
+    release_skip_entries = {
+        'META-INF/version-control-info.textproto',
+        'META-INF/com/android/build/gradle/app-metadata.properties',
+        'DebugProbesKt.bin',
+    }
     tmp_apk = apk_path + ".tmp"
     with _zf.ZipFile(apk_path, 'r') as zin, _zf.ZipFile(tmp_apk, 'w') as zout:
         for item in zin.infolist():
+            if item.filename in release_skip_entries:
+                continue
             if item.filename == 'lib/arm64-v8a/libkctf.so':
                 zout.writestr(item, stripped_patched)
             else:
                 zout.writestr(item, zin.read(item.filename))
     os.replace(tmp_apk, apk_path)
 
+    # Removing early META-INF entries shifts local-header offsets. Re-align
+    # before signing so stored native libraries remain page/alignment friendly.
+    zipalign = find_build_tool("zipalign")
+    if zipalign:
+        aligned_apk = apk_path + ".aligned"
+        subprocess.run([zipalign, "-p", "-f", "4", apk_path, aligned_apk], check=True)
+        os.replace(aligned_apk, apk_path)
+    else:
+        log("WARNING: zipalign not found, APK not realigned after metadata scrub")
+
     # Re-sign APK (zip modification invalidates existing signature)
-    apksigner = None
-    sdk = os.path.expanduser("~/AppData/Local/Android/Sdk")
-    import glob as _glob2
-    candidates = _glob2.glob(os.path.join(sdk, "build-tools/*/apksigner.bat"))
-    if candidates:
-        apksigner = sorted(candidates)[-1]
+    apksigner = find_build_tool("apksigner")
     if BUILD_TYPE == "release":
         ks = os.path.join(ROOT, "kctf2026.jks")
-        sign_args = [apksigner, "sign", "--ks", ks, "--ks-pass", "pass:kctf2026",
+        sign_args = [apksigner, "sign", "--v1-signing-enabled", "false",
+                     "--v2-signing-enabled", "false", "--v3-signing-enabled", "true",
+                     "--ks", ks, "--ks-pass", "pass:kctf2026",
                      "--ks-key-alias", "kctf", "--key-pass", "pass:kctf2026", apk_path]
     else:
         ks = os.path.expanduser("~/.android/debug.keystore")
@@ -1488,10 +2337,11 @@ def main():
     flag_b = FLAG_B
     inter = bytearray(50)
     for i in range(25):
-        inter[i * 2]     = flag_a[i]
+        inter[i * 2]     = flag_a_encoded[i]
         inter[i * 2 + 1] = flag_b[i]
 
-    log(f"Scheme A flag (hex): {flag_a.hex()}")
+    log(f"Scheme A flag (hex): {flag_a_encoded.hex()}")
+    log(f"Scheme A decoded (hex): {flag_a.hex()}")
     log(f"Scheme B flag (hex): {flag_b.hex()}")
     log(f"50-byte flag  (hex): {bytes(inter).hex()}")
     log(f"CRC32(.text) = {crc:08x}")
@@ -1514,7 +2364,7 @@ def main():
         if n: changed = True
 
         # FLAG_A
-        flag_a_b64 = base64.b64encode(flag_a).decode()
+        flag_a_b64 = base64.b64encode(flag_a_encoded).decode()
         vc, n = re.subn(r'FLAG_A\s*=\s*base64\.b64decode\("[^"]+"\)',
                         f'FLAG_A = base64.b64decode("{flag_a_b64}")', vc)
         if n: changed = True

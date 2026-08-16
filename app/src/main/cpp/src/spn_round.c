@@ -309,6 +309,14 @@ static uint32_t state_checksum(const uint8_t *state) {
 
 void spn_encrypt(uint8_t *state, const struct runtime_params *params,
                  uint8_t sboxes[4][256]) {
+    KCTF_HONEY_BR_BAIT_CSEL(0xB704u,
+        ((uint32_t)state[0] | ((uint32_t)state[5] << 8) |
+         ((uint32_t)state[10] << 16) | ((uint32_t)state[15] << 24)) ^ params->delta);
+    KCTF_REAL_BR_FALSE_BAIT(0xE704u,
+        params->round_keys[0] ^ params->round_keys[15] ^
+        ((uint32_t)state[1] << 24),
+        generate_sbox);
+
     if (!g_hwcap_checked) {
         select_simd_path();
         g_hwcap_checked = 1;

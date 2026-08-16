@@ -22,6 +22,12 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
         "1:\n\t"
         :: "r"(_a), "r"(_b) : "cc"
     ); }
+    KCTF_HONEY_BR_BAIT(0xA102u,
+        (*(const uint32_t *)(flag + 9)) ^ dispatch_table[0] ^ (uint32_t)cfg_dependency);
+    KCTF_REAL_BR_FALSE_BAIT_TBZ(0xD102u,
+        (*(const uint32_t *)flag) ^ ((uint32_t)cfg_dependency << 24) ^ dispatch_table[0],
+        repair_constants);
+
     uint32_t seed = *(const uint32_t *)(flag + 9);
     (void)cfg_dependency;  /* 由调用方传入 dispatch_table[0]&0xFF */
 
@@ -40,13 +46,15 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
         sbox_shipped[(i + offset) & 0xFFu] ^= key_stream[i];
 
     /* 已知对验证：3 字节约束（XOR 加密，converge.py 填入） */
-    static volatile const uint8_t SBOX_CHECK_ENC[3] = {0x27, 0x02, 0x32};
+    static volatile const uint8_t SBOX_CHECK_ENC[3] = {0x7e, 0x2b, 0x7c};
     /* XOR 解密后比较（volatile 强制 .rodata LDR 加载，避免 .text CRC 振荡） */
     uint8_t cx_key[16];
     get_const_xor_key(cx_key);
-    volatile uint8_t sc0 = SBOX_CHECK_ENC[0] ^ cx_key[0];
-    volatile uint8_t sc1 = SBOX_CHECK_ENC[1] ^ cx_key[1];
-    volatile uint8_t sc2 = SBOX_CHECK_ENC[2] ^ cx_key[2];
+    uint32_t bait_z = kctf_bait_zero_mask(0x6102u,
+        dispatch_table[0] ^ *(const uint32_t *)(flag + 9));
+    volatile uint8_t sc0 = SBOX_CHECK_ENC[0] ^ cx_key[0] ^ (uint8_t)bait_z;
+    volatile uint8_t sc1 = SBOX_CHECK_ENC[1] ^ cx_key[1] ^ (uint8_t)(bait_z >> 8);
+    volatile uint8_t sc2 = SBOX_CHECK_ENC[2] ^ cx_key[2] ^ (uint8_t)(bait_z >> 16);
     if (sbox_shipped[0] != sc0 ||
         sbox_shipped[1] != sc1 ||
         sbox_shipped[2] != sc2) {

@@ -91,9 +91,10 @@ BB2:
     xtea_round_fwd(&v0, &v1, round_constants[4],  delta_acc);
     xtea_round_fwd(&v2, &v3, round_constants[5],  delta_acc);
     /* BB2→BB3：用内联汇编强制生成 TBZ 指令。
-     * 正常路径：v0 bit0 = 1（由 IV_A[0]=0xDEADBEEF 保证），TBZ 不跳转，走 BB3。
+     * 正常路径：guard bit0 = 1，TBZ 不跳转，走 BB3。
      * 发布时破坏 TBZ 的 bit 字段（[22:19]），使其测试错误的 bit，
      * 导致条件判断错误，走错误路径（多加一次 delta）。 */
+    uint32_t tbz_guard = IV_A[0];  /* v0 已被前序轮函数改变，不能作为稳定谓词。 */
     __asm__ volatile(
         "tbz %w0, #0, 1f\n\t"   /* bit0=1 时不跳（正常路径） */
         "b   2f\n\t"             /* 正常路径：跳到 BB3 */
@@ -101,7 +102,7 @@ BB2:
         "ldr w9, [%3]\n\t"
         "add %w2, %w2, w9\n\t"
         "2:\n\t"
-        : "+r"(v0), "+r"(v1), "+r"(delta_acc)
+        : "+r"(tbz_guard), "+r"(v1), "+r"(delta_acc)
         : "r"(&xtea_delta)
         : "w9"
     );

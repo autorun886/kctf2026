@@ -7,11 +7,11 @@ recovers the two 25-byte halves, and prints the final 50-byte hex input.
 
 Default behavior:
   - derive soKey from the APK's stable guard section;
-  - solve flagB with the recovered ARX constraints using Z3;
+  - solve flagB with recovered oracle/material constraints using Bitwuzla/Z3;
   - derive flagA from the recovered BB offsets used by the current release;
   - interleave flagA and flagB.
 
-Use --use-known-flagb for a quick run that skips the several-minute Z3 solve.
+Use --use-known-flagb for a quick maintenance run that skips SMT solving.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parent
+MASK64 = (1 << 64) - 1
 DEFAULT_APK = ROOT / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk"
 
 GUARD_BYTES = bytes.fromhex(
@@ -40,18 +41,22 @@ GUARD_BYTES = bytes.fromhex(
 
 # Current release BB offsets.  These are the values used by flag_generate.py.
 BB_OFFSETS = {
-    "BB0_BRANCH_OFF": 0x3450,
-    "BB1_OFF": 0x3458,
-    "BB4_BRANCH_OFF": 0x37B8,
-    "DEAD_BLOCK_OFF": 0x37BC,
-    "BB5_OFF": 0x37CC,
-    "BB6_ADR_OFF": 0x3948,
-    "BB7_ENTRY_OFF": 0x3950,
+    "BB0_BRANCH_OFF": 0x6F60,
+    "BB1_OFF": 0x6F68,
+    "BB4_BRANCH_OFF": 0x72D4,
+    "DEAD_BLOCK_OFF": 0x72D8,
+    "BB5_OFF": 0x72E8,
+    "BB6_ADR_OFF": 0x7464,
+    "BB7_ENTRY_OFF": 0x746C,
 }
-
-# Scheme-B constraints recovered from the oracle and key schedule.
+# Scheme-B constraints recovered from the oracle, material checks, and the
+# simplified material[8:16] mid-tag dataflow.  material[8:16] is intentionally
+# not embedded as a public plaintext constraint.
 KNOWN_SEEDS = (0x24BE739F, 0x966CDDA1, 0xBB2307B9, 0xC9FDCDA7)
-KNOWN_MATERIAL_0_16 = bytes.fromhex("c1914230477ab65807b943e4d69eb09e")
+KNOWN_MATERIAL_0_8 = bytes.fromhex("c1914230477ab658")
+KNOWN_MATERIAL_MID_TAG = 0x56613E13
+KNOWN_FAKE_SYNDROME = 0x30
+KNOWN_A_SHARE = 0x58
 
 # This is material[60:64], not round_keys[15].  round_keys[15] also mixes the
 # IPC share in key_schedule().
@@ -214,6 +219,39 @@ def build_flag_a(so_key: bytes) -> bytes:
     return bytes(out)
 
 
+FLAG_A_PERM = [
+    7, 2, 19, 0, 14, 23, 5, 11, 21, 3, 17, 8, 24,
+    1, 12, 6, 20, 10, 4, 22, 15, 9, 18, 13, 16,
+]
+
+
+def rol8(x, n):
+    n &= 7
+    x &= 0xFF
+    return x if n == 0 else (((x << n) | (x >> (8 - n))) & 0xFF)
+
+
+def encode_flag_a(plain, so_key):
+    out = bytearray(25)
+    prev = so_key[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + so_key[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[j] = ((plain[i] ^ so_key[(i * 5 + 3) & 0x0F]) + mix) & 0xFF
+        prev = ((plain[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
+
+def decode_flag_a(encoded, so_key):
+    out = bytearray(25)
+    prev = so_key[7] ^ 0xC3
+    for i, j in enumerate(FLAG_A_PERM):
+        mix_base = (prev + i * 0x31 + so_key[(i * 7 + 1) & 0x0F]) & 0xFF
+        mix = rol8(mix_base, i)
+        out[i] = ((encoded[j] - mix) & 0xFF) ^ so_key[(i * 5 + 3) & 0x0F]
+        prev = ((out[i] + mix) & 0xFF) ^ ((0x5A + i * 0x23) & 0xFF)
+    return bytes(out)
+
 def ror64(x: int, n: int) -> int:
     return ((x >> n) | (x << (64 - n))) & ((1 << 64) - 1)
 
@@ -252,81 +290,472 @@ def expand_key_material(flag_bytes: bytes, out_len: int = 96) -> bytes:
     return bytes(out)
 
 
-def solve_flag_b(timeout_ms: int) -> bytes:
-    try:
-        from z3 import BitVec, BitVecVal, Extract, LShR, Solver, ZeroExt, sat
-    except ImportError as exc:
-        raise RuntimeError("missing z3-solver; install it or pass --use-known-flagb") from exc
+def solve_flag_b(timeout_ms: int, solver_name: str, so_key: bytes) -> bytes:
+    """Solve the missing material[8:16] state via a simplified BV model.
+
+    Public/recoverable constraints used here:
+      - material[0:8] from the oracle material-head decoder;
+      - material[80:96] from oracle seeds;
+      - material_mid_tag from the native MBA tag check;
+      - fake material syndrome, which must be a specific non-zero mismatch;
+      - final ARX preimage padding flagB || 0x5a * 7;
+      - material[60:64] as a final sanity check.
+    """
+    solver, s1, preimage_bytes = build_s1_z3_model(timeout_ms, so_key)
+    selected = solver_name
+    if selected == "auto":
+        selected = "bitwuzla"
 
     start = time.time()
-    flag = [BitVec(f"f{i}", 8) for i in range(25)]
-    buf = flag + [BitVecVal(0x5A, 8)] * 7
+    print(f"[*] {selected} solving material[8:16], timeout={timeout_ms} ms")
 
-    def bytes_to_bv64(items):
-        value = ZeroExt(56, items[0])
-        for j in range(1, 8):
-            value = value | (ZeroExt(56, items[j]) << (j * 8))
-        return value
+    if selected == "z3":
+        try:
+            from z3 import sat
+        except ImportError as exc:
+            raise RuntimeError("missing z3-solver") from exc
+        result = solver.check()
+        elapsed = time.time() - start
+        if result != sat:
+            raise RuntimeError(f"Z3 did not solve material[8:16]: {result} after {elapsed:.1f}s")
+        model = solver.model()
+        s1_value = model.eval(s1).as_long()
+        flag_b = bytes(model.eval(preimage_bytes[i]).as_long() for i in range(25))
+        print(f"[+] Z3 solved material[8:16] in {elapsed:.1f}s")
+        print(f"[+] material[8:16]={s1_value.to_bytes(8, 'little').hex()}")
+        return flag_b
 
-    def z3_ror64(x, n):
-        return LShR(x, n) | (x << (64 - n))
+    if selected == "bitwuzla":
+        try:
+            import bitwuzla
+        except ImportError as exc:
+            raise RuntimeError("missing bitwuzla Python package; pip install bitwuzla") from exc
+        mgr = bitwuzla.TermManager()
+        opts = bitwuzla.Options()
+        opts.set(bitwuzla.Option.PRODUCE_MODELS, True)
+        opts.set(bitwuzla.Option.TIME_LIMIT_PER, timeout_ms)
+        parser = bitwuzla.Parser(mgr, opts)
+        parser.parse(normalize_z3_smt2_for_bitwuzla(solver.to_smt2()).replace("(check-sat)", ""), parse_file=False)
+        bz = parser.bitwuzla()
+        result = bz.check_sat()
+        elapsed = time.time() - start
+        if str(result) != "sat":
+            raise RuntimeError(f"Bitwuzla did not solve material[8:16]: {result} after {elapsed:.1f}s")
+        funs = {str(f): f for f in parser.get_declared_funs()}
+        term = funs.get("s1")
+        if term is None:
+            raise RuntimeError("Bitwuzla model did not expose s1")
+        bits = str(bz.get_value(term))
+        s1_value = int(bits[2:], 2)
+        flag_b = recover_flag_b_from_s1(s1_value)
+        print(f"[+] Bitwuzla solved material[8:16] in {elapsed:.1f}s")
+        print(f"[+] material[8:16]={s1_value.to_bytes(8, 'little').hex()}")
+        return flag_b
 
-    def z3_rol64(x, n):
-        return (x << n) | LShR(x, 64 - n)
+    if selected == "cvc5":
+        try:
+            import cvc5
+        except ImportError as exc:
+            raise RuntimeError("missing cvc5 Python package; pip install cvc5") from exc
+        cvc = cvc5.Solver()
+        cvc.setOption("produce-models", "true")
+        cvc.setOption("tlimit-per", str(timeout_ms))
+        parser = cvc5.InputParser(cvc)
+        text = normalize_z3_smt2_for_bitwuzla(solver.to_smt2())
+        parser.setStringInput(cvc5.InputLanguage.SMT_LIB_2_6, text, "material_8_16.smt2")
+        symbols = parser.getSymbolManager()
+        result = None
+        while True:
+            cmd = parser.nextCommand()
+            if cmd.isNull():
+                break
+            out = cmd.invoke(cvc, symbols)
+            if str(cmd).startswith("(check-sat"):
+                result = out
+                break
+        elapsed = time.time() - start
+        if str(result) != "sat":
+            raise RuntimeError(f"cvc5 did not solve material[8:16]: {result} after {elapsed:.1f}s")
+        funs = {str(f): f for f in symbols.getDeclaredTerms()}
+        term = funs.get("s1")
+        if term is None:
+            raise RuntimeError("cvc5 model did not expose s1")
+        bits = str(cvc.getValue(term))
+        s1_value = int(bits[2:], 2)
+        flag_b = recover_flag_b_from_s1(s1_value)
+        print(f"[+] cvc5 solved material[8:16] in {elapsed:.1f}s")
+        print(f"[+] material[8:16]={s1_value.to_bytes(8, 'little').hex()}")
+        return flag_b
 
-    state = [bytes_to_bv64(buf[i * 8 : (i + 1) * 8]) for i in range(4)]
-    for r in range(12):
-        state[0] = (z3_ror64(state[0], 8) + state[1]) ^ BitVecVal(r, 64)
-        state[1] = z3_rol64(state[1], 3) ^ state[0]
-        state[2] = (z3_ror64(state[2], 8) + state[3]) ^ BitVecVal(r + 4, 64)
-        state[3] = z3_rol64(state[3], 3) ^ state[2]
-        state[0] = state[0] ^ state[3]
-        state[2] = state[2] ^ state[1]
+    raise ValueError(f"unsupported solver: {solver_name}")
 
-    material = []
-    squeeze = list(state)
-    for _ in range(3):
-        for word in squeeze:
-            for j in range(8):
-                material.append(Extract(j * 8 + 7, j * 8, word))
-        squeeze[0] = squeeze[0] + squeeze[2]
-        squeeze[1] = squeeze[1] ^ squeeze[3]
-        squeeze[2] = z3_rol64(squeeze[2], 17)
-        squeeze[3] = z3_ror64(squeeze[3], 11)
 
+
+def normalize_z3_smt2_for_bitwuzla(text: str) -> str:
+    # Z3 prints fixed rotates as (ext_rotate_left x (_ bvN W)); Bitwuzla
+    # accepts the SMT-LIB indexed form ((_ rotate_left N) x).
+    import re
+    pattern = re.compile(r"\(ext_rotate_(left|right) ([^()]+|\([^()]*\)) \(_ bv(\d+) \d+\)\)")
+    prev = None
+    while prev != text:
+        prev = text
+        text = pattern.sub(lambda m: f"((_ rotate_{m.group(1)} {m.group(3)}) {m.group(2)})", text)
+    if "(set-logic" not in text[:512]:
+        text = "(set-logic QF_BV)\n" + text
+    return text
+
+def build_s1_z3_model(timeout_ms: int, so_key: bytes):
+    try:
+        from z3 import BitVec, BitVecVal, Concat, Extract, LShR, Solver, ZeroExt
+    except ImportError as exc:
+        raise RuntimeError("z3-solver is required to build the SMT model") from exc
+
+    def bv32(v: int):
+        return BitVecVal(v & 0xFFFFFFFF, 32)
+
+    def bv64(v: int):
+        return BitVecVal(v & MASK64, 64)
+
+    def byte32(x, i: int):
+        return Extract(8 * i + 7, 8 * i, x)
+
+    def pack4(bs):
+        return Concat(bs[3], bs[2], bs[1], bs[0])
+
+    def xtime(a):
+        return (a << 1) ^ (LShR(a, 7) * BitVecVal(0x1B, 8))
+
+    def gf_mul_const(a, c: int):
+        r = BitVecVal(0, 8)
+        x = a
+        while c:
+            if c & 1:
+                r = r ^ x
+            x = xtime(x)
+            c >>= 1
+        return r
+
+    def mds32(x):
+        a = [byte32(x, i) for i in range(4)]
+        return pack4([
+            gf_mul_const(a[0], 2) ^ gf_mul_const(a[1], 3) ^ a[2] ^ a[3],
+            a[0] ^ gf_mul_const(a[1], 2) ^ gf_mul_const(a[2], 3) ^ a[3],
+            a[0] ^ a[1] ^ gf_mul_const(a[2], 2) ^ gf_mul_const(a[3], 3),
+            gf_mul_const(a[0], 3) ^ a[1] ^ a[2] ^ gf_mul_const(a[3], 2),
+        ])
+
+    def inv_mds32(x):
+        a = [byte32(x, i) for i in range(4)]
+        return pack4([
+            gf_mul_const(a[0], 0x0E) ^ gf_mul_const(a[1], 0x0B) ^ gf_mul_const(a[2], 0x0D) ^ gf_mul_const(a[3], 0x09),
+            gf_mul_const(a[0], 0x09) ^ gf_mul_const(a[1], 0x0E) ^ gf_mul_const(a[2], 0x0B) ^ gf_mul_const(a[3], 0x0D),
+            gf_mul_const(a[0], 0x0D) ^ gf_mul_const(a[1], 0x09) ^ gf_mul_const(a[2], 0x0E) ^ gf_mul_const(a[3], 0x0B),
+            gf_mul_const(a[0], 0x0B) ^ gf_mul_const(a[1], 0x0D) ^ gf_mul_const(a[2], 0x09) ^ gf_mul_const(a[3], 0x0E),
+        ])
+
+    def fbox32(x, k):
+        x = x ^ k
+        x = x * bv32(0x045D9F3B)
+        x = x ^ LShR(x, 16)
+        x = x * bv32(0x119DE1F3)
+        x = x ^ LShR(x, 15)
+        return x
+
+    def feistel32(x, k):
+        l = Extract(15, 0, x)
+        r = Extract(31, 16, x)
+        l = l ^ Extract(15, 0, fbox32(ZeroExt(16, r), k))
+        r = r ^ Extract(15, 0, fbox32(ZeroExt(16, l), k ^ bv32(0x9E37)))
+        return Concat(r, l)
+
+    def zrol32(x, n: int):
+        n &= 31
+        return x if n == 0 else ((x << n) | LShR(x, 32 - n))
+
+    def zrol64(x, n: int):
+        n &= 63
+        return x if n == 0 else ((x << n) | LShR(x, 64 - n))
+
+    def zror64(x, n: int):
+        n &= 63
+        return x if n == 0 else (LShR(x, n) | (x << (64 - n)))
+
+    def zrol8(x, n: int):
+        n &= 7
+        return x if n == 0 else ((x << n) | LShR(x, 8 - n))
+
+    def ch32(x, y, z, salt: int):
+        yy = y ^ bv32((salt * 0x01010101) & 0xFFFFFFFF)
+        zz = z ^ bv32(rol32(salt, 7))
+        out = (x & yy) ^ (~x & zz)
+        return out ^ ((bv32(salt) ^ zrol32(x, 3)) * bv32(0x045D9F3B))
+
+    def maj32(x, y, z, salt: int):
+        a = x ^ bv32(rol32(salt, 11))
+        b = y ^ bv32((salt * 0x9E3779B1) & 0xFFFFFFFF)
+        c = z ^ zrol32(bv32(salt) ^ x, 19)
+        return (a & b) ^ (a & c) ^ (b & c)
+
+    def poly32(x, y, z, salt: int):
+        p = (x ^ zrol32(y, 5)) + ((z | bv32(1)) * bv32(salt | 1))
+        q = (p & zrol32(x, 11)) ^ (~p & zrol32(y ^ z, 17))
+        q = q + ((x ^ z) * bv32(0x119DE1F3))
+        return q
+
+    def midtag(s1):
+        seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
+        lo = Extract(31, 0, s1)
+        hi = Extract(63, 32, s1)
+        a = lo ^ bv32(u32(so_key, 0))
+        b = hi ^ bv32(u32(so_key, 4))
+        c = bv32(u32(KNOWN_MATERIAL_0_8, 0) ^ u32(seed_bytes, 8))
+        d = bv32(u32(KNOWN_MATERIAL_0_8, 4) ^ u32(seed_bytes, 12))
+        for r in range(4):
+            sw = bv32(u32(seed_bytes, (r & 3) * 4))
+            salt = (0x7E3A19C5 ^ (r * 0x045D9F3B) ^ (KNOWN_A_SHARE * 0x01010101)) & 0xFFFFFFFF
+            ch = ch32(a ^ sw, b, c, salt ^ 0xD6E8FEB8)
+            maj = maj32(a, c ^ sw, d, salt ^ 0xC2B2AE35)
+            poly = poly32(b ^ sw, c + bv32(salt), d ^ bv32(KNOWN_A_SHARE), salt ^ 0x165667B1)
+            f = fbox32((b ^ ch) ^ zrol32(c ^ maj, r + 3), (sw ^ poly) ^ d)
+            g = mds32((a ^ maj) ^ f ^ poly)
+            feed = (a & zrol32(b, r + 5)) ^ (~b & zrol32(c ^ d ^ ch, r + 1))
+            a = zrol32(a + (g ^ feed), 5 + (r & 7))
+            b = zrol32(b + (a * bv32(0x9E3779B1 + r * 2)), 11 + r) ^ inv_mds32(g) ^ ch
+            c = (c ^ zrol32(a ^ poly, r + 7)) + (b ^ sw ^ maj)
+            d = zrol32(d + (c ^ ch ^ LShR(a, (r & 7) + 1)), 3 + ((r * 5) & 15))
+        x = (a ^ zrol32(b, 13)) + (c ^ zrol32(d, 19))
+        x = x ^ bv32(KNOWN_A_SHARE * 0x01020408)
+        return x
+
+    s1 = BitVec("s1", 64)
     solver = Solver()
     solver.set("timeout", timeout_ms)
-
-    for i, b in enumerate(KNOWN_MATERIAL_0_16):
-        solver.add(material[i] == BitVecVal(b, 8))
-
+    solver.add(midtag(s1) == bv32(KNOWN_MATERIAL_MID_TAG))
     seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
-    for i, b in enumerate(seed_bytes):
-        solver.add(material[80 + i] == BitVecVal(b, 8))
+    solver.add(Extract(63, 32, zror64(bv64(rol64(u64(seed_bytes, 8), 22)), 11)) == bv32(u32(KNOWN_MATERIAL_60_64, 0)))
 
-    for i, b in enumerate(KNOWN_MATERIAL_60_64):
-        solver.add(material[60 + i] == BitVecVal(b, 8))
+    def fake_syndrome(s1_term):
+        cx_key = compute_const_xor_key()
+        hint_enc = bytes(
+            [
+                0xB2, 0x71, 0x0E, 0x5D, 0x93, 0x42, 0xC8, 0x1F,
+                0x2A, 0xE4, 0x77, 0x90, 0x5C, 0x39, 0xA6, 0xD1,
+            ]
+        )
+        hint = [
+            (hint_enc[i] ^ cx_key[i & 0x0F] ^ ((KNOWN_A_SHARE + i * 0x2B) & 0xFF)) & 0xFF
+            for i in range(16)
+        ]
+        seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
+        material_bytes = (
+            [BitVecVal(b, 8) for b in KNOWN_MATERIAL_0_8]
+            + [Extract(8 * i + 7, 8 * i, s1_term) for i in range(8)]
+            + [BitVecVal(b, 8) for b in struct.pack("<Q", ror64(u64(seed_bytes, 0), 34))]
+            + [BitVecVal(b, 8) for b in struct.pack("<Q", rol64(u64(seed_bytes, 8), 22))]
+        )
+        syndrome = BitVecVal(((KNOWN_A_SHARE + 0x6D) & 0xFF) ^ KNOWN_MATERIAL_0_8[7], 8)
+        for i in range(16):
+            lane = material_bytes[8 + ((i * 5 + 3) & 0x0F)]
+            d = lane ^ BitVecVal(hint[i], 8)
+            echo = zrol8(material_bytes[16 + ((i * 3 + 1) & 0x0F)], i + 1)
+            d = d ^ echo
+            syndrome = syndrome + d + BitVecVal((i * 0x17) & 0xFF, 8)
+            syndrome = zrol8(syndrome, (i & 3) + 1)
+            syndrome = syndrome ^ ((d * BitVecVal(0x3D, 8)) + BitVecVal(i, 8))
+        return syndrome
 
-    print(f"[*] Z3 solving flagB, timeout={timeout_ms} ms")
-    result = solver.check()
-    elapsed = time.time() - start
-    if result != sat:
-        raise RuntimeError(f"Z3 did not solve flagB: {result} after {elapsed:.1f}s")
+    solver.add(fake_syndrome(s1) == BitVecVal(KNOWN_FAKE_SYNDROME, 8))
 
-    model = solver.model()
-    flag_b = bytes(model.eval(flag[i]).as_long() for i in range(25))
-    print(f"[+] Z3 solved flagB in {elapsed:.1f}s")
-    return flag_b
+    state = recover_initial_state_terms(s1, bv64, zrol64, zror64)
+    preimage_bytes = [Extract(8 * i + 7, 8 * i, word) for word in state for i in range(8)]
+    for i in range(25, 32):
+        solver.add(preimage_bytes[i] == BitVecVal(0x5A, 8))
+    return solver, s1, preimage_bytes
 
 
-def assert_flag_b_constraints(flag_b: bytes) -> None:
+def recover_initial_state_terms(s1, bv64, zrol64, zror64):
+    seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
+    s0 = u64(KNOWN_MATERIAL_0_8, 0)
+    s2 = ror64(u64(seed_bytes, 0), 34)
+    s3 = rol64(u64(seed_bytes, 8), 22)
+    state = [bv64(s0), s1, bv64(s2), bv64(s3)]
+    for r in range(11, -1, -1):
+        e0, e1, e2, e3 = state
+        d3 = e3
+        d1 = e1
+        d0 = e0 ^ e3
+        d2 = e2 ^ e1
+        c3 = zror64(d3 ^ d2, 3)
+        c2 = zrol64((d2 ^ bv64(r + 4)) - c3, 8)
+        c1 = zror64(d1 ^ d0, 3)
+        c0 = zrol64((d0 ^ bv64(r)) - c1, 8)
+        state = [c0, c1, c2, c3]
+    return state
+
+
+def recover_flag_b_from_s1(s1_value: int) -> bytes:
+    seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
+    state = [
+        u64(KNOWN_MATERIAL_0_8, 0),
+        s1_value & MASK64,
+        ror64(u64(seed_bytes, 0), 34),
+        rol64(u64(seed_bytes, 8), 22),
+    ]
+    for r in range(11, -1, -1):
+        e0, e1, e2, e3 = state
+        d3 = e3
+        d1 = e1
+        d0 = e0 ^ e3
+        d2 = e2 ^ e1
+        c3 = ror64(d3 ^ d2, 3)
+        c2 = rol64(((d2 ^ (r + 4)) - c3) & MASK64, 8)
+        c1 = ror64(d1 ^ d0, 3)
+        c0 = rol64(((d0 ^ r) - c1) & MASK64, 8)
+        state = [c0, c1, c2, c3]
+    buf = struct.pack("<4Q", *state)
+    if buf[25:] != b"\x5A" * 7:
+        raise RuntimeError("SMT result failed flagB padding check")
+    return buf[:25]
+
+def assert_flag_b_constraints(flag_b: bytes, so_key: bytes) -> None:
     material = expand_key_material(flag_b, 96)
-    if material[:16] != KNOWN_MATERIAL_0_16:
-        raise AssertionError("flagB failed material[0:16] constraint")
-    if material[80:96] != struct.pack("<4I", *KNOWN_SEEDS):
+    seed_bytes = struct.pack("<4I", *KNOWN_SEEDS)
+    if material[:8] != KNOWN_MATERIAL_0_8:
+        raise AssertionError("flagB failed material[0:8] constraint")
+    if material[80:96] != seed_bytes:
         raise AssertionError("flagB failed material[80:96] seed constraint")
     if material[60:64] != KNOWN_MATERIAL_60_64:
         raise AssertionError("flagB failed material[60:64] constraint")
+    if derive_material_mid_tag_int(material[:16], seed_bytes, so_key, KNOWN_A_SHARE) != KNOWN_MATERIAL_MID_TAG:
+        raise AssertionError("flagB failed material[8:16] mid-tag constraint")
+    if derive_fake_syndrome_int(flag_b, KNOWN_A_SHARE) != KNOWN_FAKE_SYNDROME:
+        raise AssertionError("flagB failed fake syndrome constraint")
+
+
+def derive_fake_syndrome_int(flag_b: bytes, a_share: int) -> int:
+    material = expand_key_material(flag_b, 32)
+    cx_key = compute_const_xor_key()
+    hint_enc = bytes(
+        [
+            0xB2, 0x71, 0x0E, 0x5D, 0x93, 0x42, 0xC8, 0x1F,
+            0x2A, 0xE4, 0x77, 0x90, 0x5C, 0x39, 0xA6, 0xD1,
+        ]
+    )
+    hint = bytearray(hint_enc[i] ^ cx_key[i & 0x0F] for i in range(16))
+    for i in range(16):
+        hint[i] ^= (a_share + i * 0x2B) & 0xFF
+
+    syndrome = ((a_share + 0x6D) & 0xFF) ^ material[7]
+    for i in range(16):
+        lane = material[8 + ((i * 5 + 3) & 0x0F)]
+        d = lane ^ hint[i]
+        echo = rol8(material[16 + ((i * 3 + 1) & 0x0F)], i + 1)
+        d ^= echo
+        syndrome = (syndrome + ((d + i * 0x17) & 0xFF)) & 0xFF
+        syndrome = rol8(syndrome, (i & 3) + 1)
+        syndrome ^= (d * 0x3D + i) & 0xFF
+    return syndrome & 0xFF
+
+
+def derive_material_mid_tag_int(material: bytes, seeds: bytes, so_key: bytes, a_share: int) -> int:
+    def mds32(x):
+        a0, a1, a2, a3 = x & 0xFF, (x >> 8) & 0xFF, (x >> 16) & 0xFF, (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 2) ^ gf_mul(a1, 3) ^ a2 ^ a3
+        b1 = a0 ^ gf_mul(a1, 2) ^ gf_mul(a2, 3) ^ a3
+        b2 = a0 ^ a1 ^ gf_mul(a2, 2) ^ gf_mul(a3, 3)
+        b3 = gf_mul(a0, 3) ^ a1 ^ a2 ^ gf_mul(a3, 2)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def inv_mds32(x):
+        a0, a1, a2, a3 = x & 0xFF, (x >> 8) & 0xFF, (x >> 16) & 0xFF, (x >> 24) & 0xFF
+        b0 = gf_mul(a0, 0x0E) ^ gf_mul(a1, 0x0B) ^ gf_mul(a2, 0x0D) ^ gf_mul(a3, 0x09)
+        b1 = gf_mul(a0, 0x09) ^ gf_mul(a1, 0x0E) ^ gf_mul(a2, 0x0B) ^ gf_mul(a3, 0x0D)
+        b2 = gf_mul(a0, 0x0D) ^ gf_mul(a1, 0x09) ^ gf_mul(a2, 0x0E) ^ gf_mul(a3, 0x0B)
+        b3 = gf_mul(a0, 0x0B) ^ gf_mul(a1, 0x0D) ^ gf_mul(a2, 0x09) ^ gf_mul(a3, 0x0E)
+        return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) & 0xFFFFFFFF
+
+    def fbox32(x, k):
+        x = (x ^ k) & 0xFFFFFFFF
+        x = (x * 0x045D9F3B) & 0xFFFFFFFF
+        x ^= x >> 16
+        x = (x * 0x119DE1F3) & 0xFFFFFFFF
+        x ^= x >> 15
+        return x & 0xFFFFFFFF
+
+    def feistel32(x, k):
+        l, r = x & 0xFFFF, (x >> 16) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def inv_feistel32(x, k):
+        l, r = x & 0xFFFF, (x >> 16) & 0xFFFF
+        r ^= fbox32(l, k ^ 0x9E37) & 0xFFFF
+        l ^= fbox32(r, k) & 0xFFFF
+        return (l | (r << 16)) & 0xFFFFFFFF
+
+    def mba_add32(a, b, salt):
+        s = a & 0xFFFFFFFF
+        c = b & 0xFFFFFFFF
+        for _ in range(32):
+            ns = (s ^ c) & 0xFFFFFFFF
+            c = ((s & c) << 1) & 0xFFFFFFFF
+            s = ns
+        return inv_feistel32(feistel32(s, salt), salt)
+
+    def mba_xor32(a, b, salt):
+        ma = fbox32(salt, 0xA0761D64)
+        mb = fbox32(salt ^ 0xE7037ED1, 0x8EBC6AF1)
+        t = (inv_mds32(mds32((a ^ ma) & 0xFFFFFFFF) ^ mds32((b ^ mb) & 0xFFFFFFFF)) ^ ma ^ mb) & 0xFFFFFFFF
+        return inv_feistel32(feistel32(t, ma ^ mb), ma ^ mb)
+
+    def ch32(x, y, z, salt):
+        yy = mba_xor32(y, (salt * 0x01010101) & 0xFFFFFFFF, salt ^ 0xB492B66F)
+        zz = mba_xor32(z, rol32(salt, 7), salt ^ 0x9E3779B9)
+        out = ((x & yy) ^ ((~x & 0xFFFFFFFF) & zz)) & 0xFFFFFFFF
+        return mba_xor32(out, ((salt ^ rol32(x, 3)) * 0x045D9F3B) & 0xFFFFFFFF, salt ^ 0x6A09E667)
+
+    def maj32(x, y, z, salt):
+        a = mba_xor32(x, rol32(salt, 11), salt ^ 0xBB67AE85)
+        b = mba_xor32(y, (salt * 0x9E3779B1) & 0xFFFFFFFF, salt ^ 0x3C6EF372)
+        c = mba_xor32(z, rol32(salt ^ x, 19), salt ^ 0xA54FF53A)
+        out = ((a & b) ^ (a & c) ^ (b & c)) & 0xFFFFFFFF
+        return inv_mds32(mds32(out))
+
+    def poly32(x, y, z, salt):
+        p = mba_add32(mba_xor32(x, rol32(y, 5), salt ^ 0x510E527F),
+                      ((z | 1) * (salt | 1)) & 0xFFFFFFFF,
+                      salt ^ 0x9B05688C)
+        q = ((p & rol32(x, 11)) ^ ((~p & 0xFFFFFFFF) & rol32(mba_xor32(y, z, salt ^ 0x1F83D9AB), 17))) & 0xFFFFFFFF
+        q = mba_add32(q, (mba_xor32(x, z, salt ^ 0x5BE0CD19) * 0x119DE1F3) & 0xFFFFFFFF,
+                      salt ^ 0xC3A5C85C)
+        return inv_feistel32(feistel32(q, salt ^ p), salt ^ p)
+
+    a = mba_xor32(u32(material, 8), u32(so_key, 0), 0xD1B54A32)
+    b = mba_xor32(u32(material, 12), u32(so_key, 4), 0x94D049BB)
+    c = mba_xor32(u32(material, 0), u32(seeds, 8), 0x2545F491)
+    d = mba_xor32(u32(material, 4), u32(seeds, 12), 0x9E3779B9)
+    for r in range(4):
+        sw = u32(seeds, (r & 3) * 4)
+        salt = (0x7E3A19C5 ^ (r * 0x045D9F3B) ^ (a_share * 0x01010101)) & 0xFFFFFFFF
+        ch = ch32(a ^ sw, b, c, salt ^ 0xD6E8FEB8)
+        maj = maj32(a, c ^ sw, d, salt ^ 0xC2B2AE35)
+        poly = poly32(b ^ sw, (c + salt) & 0xFFFFFFFF, d ^ a_share, salt ^ 0x165667B1)
+        f = fbox32(mba_xor32(b ^ ch, rol32(c ^ maj, r + 3), salt),
+                   mba_xor32(sw ^ poly, d, salt ^ 0xA0761D64))
+        g = mds32(mba_xor32(a ^ maj, f ^ poly, salt ^ 0xE7037ED1))
+        feed = ((a & rol32(b, r + 5)) ^ ((~b & 0xFFFFFFFF) & rol32(c ^ d ^ ch, r + 1))) & 0xFFFFFFFF
+        a = rol32(mba_add32(a, mba_xor32(g, feed, salt ^ 0x8EBC6AF1), salt ^ 0xD6E8FEB8),
+                  5 + (r & 7))
+        b = (rol32(mba_add32(b, (a * (0x9E3779B1 + r * 2)) & 0xFFFFFFFF,
+                              salt ^ 0x94D049BB), 11 + r) ^ inv_mds32(g) ^ ch) & 0xFFFFFFFF
+        c = mba_add32(c ^ rol32(a ^ poly, r + 7), b ^ sw ^ maj, salt ^ 0xC3A5C85C)
+        d = rol32((d + mba_xor32(c ^ ch, a >> ((r & 7) + 1), salt ^ 0x27D4EB2F)) & 0xFFFFFFFF,
+                  3 + ((r * 5) & 15))
+    x = mba_xor32(a, rol32(b, 13), 0x6A09E667)
+    x = mba_add32(x, mba_xor32(c, rol32(d, 19), 0xBB67AE85), 0x3C6EF372)
+    x = mba_xor32(x, (a_share * 0x01020408) & 0xFFFFFFFF, 0xA54FF53A)
+    return inv_feistel32(feistel32(x, x ^ u32(so_key, 8)), x ^ u32(so_key, 8))
 
 
 def compute_const_xor_key() -> bytes:
@@ -348,7 +777,14 @@ def compute_const_xor_key() -> bytes:
 
 
 def ror32(x: int, n: int) -> int:
-    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+    n &= 31
+    x &= 0xFFFFFFFF
+    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF if n else x
+
+def rol32(x: int, n: int) -> int:
+    n &= 31
+    x &= 0xFFFFFFFF
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF if n else x
 
 
 def compute_ipc_material() -> bytes:
@@ -385,6 +821,10 @@ def key_schedule_b(flag_b: bytes, so_key: bytes) -> dict[str, object]:
     seeds = [u32(material, 80 + i * 4) for i in range(4)]
     delta = u32(material, 96) ^ u32(material, 112)
     check = round_keys[15] ^ u32(so_key, 12)
+    expected_check = u32(KNOWN_MATERIAL_60_64, 0) ^ u32(so_key, 12)
+    diff = check ^ expected_check
+    poison = (((diff | ((~diff + 1) & 0xFFFFFFFF)) >> 31) & 1) * 0xDEADBEEF
+    delta ^= poison
     return {
         "material": bytes(material),
         "round_keys": round_keys,
@@ -392,6 +832,8 @@ def key_schedule_b(flag_b: bytes, so_key: bytes) -> dict[str, object]:
         "seeds": seeds,
         "delta": delta,
         "check": check,
+        "expected_check": expected_check,
+        "check_poison": poison,
     }
 
 
@@ -530,22 +972,33 @@ def maybe_extract_source_diagnostics(so_key: bytes, schedule: dict[str, object])
 
     lines: list[str] = []
     cx_key = compute_const_xor_key()
-    check = schedule["check"]
-    assert isinstance(check, int)
+    expected_check = schedule["expected_check"]
+    assert isinstance(expected_check, int)
 
     key_text = key_expand.read_text(encoding="utf-8", errors="replace")
+    jni_text = jni_entry.read_text(encoding="utf-8", errors="replace")
     m = re.search(r"EXPECTED_SOKEY_CHECK_ENC\s*=\s*(0x[0-9a-fA-F]+)u", key_text)
     if m:
         current_enc = int(m.group(1), 16)
         current_plain = current_enc ^ u32(cx_key, 0)
-        needed_enc = check ^ u32(cx_key, 0)
-        status = "MATCH" if current_plain == check else "MISMATCH"
+        needed_enc = expected_check ^ u32(cx_key, 0)
+        status = "MATCH" if current_plain == expected_check else "MISMATCH"
         lines.append(
             f"source EXPECTED_SOKEY_CHECK: {current_plain:#010x} "
             f"({status}; needed_enc={needed_enc:#010x})"
         )
 
-    jni_text = jni_entry.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"EXPECTED_FAKE_SYNDROME_ENC\s*=\s*(0x[0-9a-fA-F]+)u", jni_text)
+    if m:
+        current_enc = int(m.group(1), 16)
+        current_plain = current_enc ^ cx_key[0]
+        needed_enc = KNOWN_FAKE_SYNDROME ^ cx_key[0]
+        status = "MATCH" if current_plain == KNOWN_FAKE_SYNDROME else "MISMATCH"
+        lines.append(
+            f"source EXPECTED_FAKE_SYNDROME: {current_plain:#04x} "
+            f"({status}; needed_enc={needed_enc:#04x})"
+        )
+
     for name, final_state in (
         ("ENC_EXPECTED_STATE_ENC", spn_encrypt(IV1, schedule)),
         ("ENC_EXPECTED_STATE2_ENC", spn_encrypt(IV2, schedule)),
@@ -586,8 +1039,14 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--timeout-ms",
         type=int,
-        default=1_800_000,
-        help="Z3 timeout in milliseconds.",
+        default=300_000,
+        help="SMT timeout in milliseconds.",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=("auto", "bitwuzla", "cvc5", "z3"),
+        default="auto",
+        help="SMT backend for material[8:16] (auto prefers Bitwuzla).",
     )
     parser.add_argument(
         "--no-diagnostics",
@@ -617,19 +1076,21 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
         flag_b = KNOWN_FLAG_B
         print("[*] flagB mode: known recovered value")
     else:
-        flag_b = solve_flag_b(args.timeout_ms)
+        flag_b = solve_flag_b(args.timeout_ms, args.solver, so_key)
 
-    assert_flag_b_constraints(flag_b)
+    assert_flag_b_constraints(flag_b, so_key)
     if flag_b == KNOWN_FLAG_B:
         print("[+] flagB matches current recovered value")
     else:
         print("[!] flagB differs from embedded known value but satisfies constraints")
 
-    flag_a = build_flag_a(so_key)
+    flag_a_plain = build_flag_a(so_key)
+    flag_a = encode_flag_a(flag_a_plain, so_key)
     final_flag = interleave(flag_a, flag_b)
 
     schedule = key_schedule_b(flag_b, so_key)
     print(f"flagA={flag_a.hex()}")
+    print(f"flagA_decoded={flag_a_plain.hex()}")
     print(f"flagB={flag_b.hex()}")
     print(f"flag={final_flag.hex()}")
     print(f"schemeB_clean_check={schedule['check']:#010x}")
