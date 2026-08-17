@@ -46,7 +46,7 @@ void repair_sbox(const uint8_t *flag, uint8_t cfg_dependency) {
         sbox_shipped[(i + offset) & 0xFFu] ^= key_stream[i];
 
     /* 已知对验证：3 字节约束（XOR 加密，converge.py 填入） */
-    static volatile const uint8_t SBOX_CHECK_ENC[3] = {0x7e, 0x2b, 0x7c};
+    static volatile const uint8_t SBOX_CHECK_ENC[3] = {0x4d, 0x28, 0x81};
     /* XOR 解密后比较（volatile 强制 .rodata LDR 加载，避免 .text CRC 振荡） */
     uint8_t cx_key[16];
     get_const_xor_key(cx_key);

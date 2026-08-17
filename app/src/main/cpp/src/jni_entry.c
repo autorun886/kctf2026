@@ -47,8 +47,8 @@ uint32_t cxk_get_piece2(void) {
 
 /* 方案 A 目标状态分片（converge.py 填入） */
 static volatile const uint8_t ENC_EXPECTED_STATE_A_S0[STATE_LEN] = {
-    0xE8, 0xAC, 0x59, 0x2B, 0x28, 0x39, 0x83, 0xE0,
-    0x53, 0xB5, 0x1D, 0xF6, 0x3F, 0x88, 0x7B, 0x11
+    0xDF, 0xC9, 0x64, 0xA0, 0x13, 0x14, 0x4F, 0xE5,
+    0xE0, 0x87, 0x02, 0x5D, 0x5E, 0x5D, 0x4E, 0xE2
 };
 static volatile const uint8_t ENC_EXPECTED_STATE_A_S1[STATE_LEN] = {
     0x50, 0xC1, 0x32, 0xA3, 0x14, 0x85, 0xF6, 0x67,
@@ -72,7 +72,7 @@ static volatile const uint8_t MATERIAL_SHARD_ROUTE[12] = {
 /* fake material corruption syndrome 分片（converge.py 填入） */
 static volatile const uint8_t MATERIAL_FAKE_SYNDROME_SHARD = 0x85u;
 /* Scheme A share 版本补偿（converge.py 填入，稳定公开 Q46 目标实例） */
-static volatile const uint8_t SCHEME_A_SHARE_TUNE = 0xc4u;
+static volatile const uint8_t SCHEME_A_SHARE_TUNE = 0x2au;
 
 static uint32_t load_le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
@@ -171,8 +171,22 @@ static uint8_t sokey_share_mask(int i) {
     return (uint8_t)(((0x6Du + (uint32_t)i * 0x3Bu) ^ ((uint32_t)i * 0x1Du)) & 0xFFu);
 }
 
-static uint32_t java_archive_profile_word(const uint8_t meta[32]) {
-    uint32_t x = 0x5EED4A71u ^ 0x6B02C3A5u;
+#define JAVA_PROFILE_SEED_DEFAULT 0x5EED4A71u
+
+static uint32_t java_profile_runtime_seed(void) {
+    uint32_t x = kctf_guard_anchor() ^ 0xA91D3B05u;
+    x ^= rol32((uint32_t)((uintptr_t)(const void *)&java_profile_runtime_seed >> 4), 5u);
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    x ^= JAVA_PROFILE_SEED_DEFAULT ^ 0xD046E405u;
+    return x ? x : (JAVA_PROFILE_SEED_DEFAULT ^ 0x13579BDFu);
+}
+
+static uint32_t java_archive_profile_word(const uint8_t meta[32], uint32_t seed) {
+    uint32_t x = seed ^ 0x6B02C3A5u;
     uint32_t crc = load_le32(meta + 16);
     uint32_t off = load_le32(meta + 20);
     uint32_t size = load_le32(meta + 24);
@@ -201,7 +215,7 @@ static uint32_t java_archive_profile_word(const uint8_t meta[32]) {
                 }
                 break;
             case 0x49u:
-                x ^= rol32(0x5EED4A71u + idx + 0x165667B1u, idx & 15u);
+                x ^= rol32(seed + idx + 0x165667B1u, idx & 15u);
                 pc = 0x34u;
                 break;
             case 0x5Du:
@@ -610,9 +624,24 @@ static void decode_jni_token(char *out, const volatile uint8_t *enc,
     out[len] = '\0';
 }
 
-/* ── JNI 回调获取 soKey ──────────────────────────────────── */
-static void fetch_sokey(JNIEnv *env, jobject obj, uint8_t out[SOKEY_LEN]) {
-    (void)kctf_guard_anchor();
+static jfieldID java_archive_shadow_slot(JNIEnv *env, jclass clazz, uint32_t lane) {
+    static const volatile uint8_t field_enc[] = { 0xDFu };
+    static const volatile uint8_t sig_enc[] = { 0xF2u };
+    char field_name[2];
+    char field_sig[2];
+    uint32_t lane_mask = (lane ^ lane) & 0x7F4A7C15u;
+    decode_jni_token(field_name, field_enc, 1, 0xA91D3B05u ^ lane_mask);
+    decode_jni_token(field_sig, sig_enc, 1, 0xD046E405u ^ lane_mask);
+    jfieldID fid = (*env)->GetStaticFieldID(env, clazz, field_name, field_sig);
+    secure_bzero(field_name, sizeof(field_name));
+    secure_bzero(field_sig, sizeof(field_sig));
+    if (!fid && (*env)->ExceptionCheck(env))
+        (*env)->ExceptionClear(env);
+    return fid;
+}
+
+static jsize collect_java_archive_meta(JNIEnv *env, jobject obj, uint8_t *meta,
+                                       jsize meta_cap, uint32_t *profile_seed) {
     static const volatile uint8_t method_enc[] = { 0x3Fu };
     static const volatile uint8_t sig_enc[] = { 0xE2u, 0xB7u, 0x19u, 0x0Du };
     char method_name[2];
@@ -620,29 +649,94 @@ static void fetch_sokey(JNIEnv *env, jobject obj, uint8_t out[SOKEY_LEN]) {
     decode_jni_token(method_name, method_enc, 1, 0x4D5A6B7Cu);
     decode_jni_token(method_sig, sig_enc, 4, 0x9E3779B9u);
 
-    jclass    clazz = (*env)->GetObjectClass(env, obj);
-    jmethodID mid   = (*env)->GetMethodID(env, clazz, method_name, method_sig);
-    jbyteArray jarr = NULL;
-    if (mid) {
-        jarr = (jbyteArray)(*env)->CallObjectMethod(env, obj, mid);
-    } else if ((*env)->ExceptionCheck(env)) {
+    jclass clazz = (*env)->GetObjectClass(env, obj);
+    jmethodID mid = clazz ? (*env)->GetMethodID(env, clazz, method_name, method_sig) : NULL;
+    if (!mid && (*env)->ExceptionCheck(env))
         (*env)->ExceptionClear(env);
+
+    uint32_t seed = JAVA_PROFILE_SEED_DEFAULT;
+    uint32_t previous = JAVA_PROFILE_SEED_DEFAULT;
+    jfieldID shadow = NULL;
+    uint32_t lane = java_profile_runtime_seed();
+    uint32_t pc = 0x42u;
+
+    while (pc != 0x7Eu) {
+        switch (pc) {
+            case 0x42u:
+                shadow = clazz ? java_archive_shadow_slot(env, clazz, lane) : NULL;
+                pc = shadow ? 0x19u : 0x53u;
+                break;
+            case 0x19u:
+                previous = (uint32_t)(*env)->GetStaticIntField(env, clazz, shadow);
+                if ((*env)->ExceptionCheck(env)) {
+                    (*env)->ExceptionClear(env);
+                    shadow = NULL;
+                    pc = 0x53u;
+                    break;
+                }
+                seed = lane ^ ((lane ^ lane) & 0xC3A5C85Cu);
+                (*env)->SetStaticIntField(env, clazz, shadow, (jint)seed);
+                if ((*env)->ExceptionCheck(env)) {
+                    (*env)->ExceptionClear(env);
+                    shadow = NULL;
+                    seed = JAVA_PROFILE_SEED_DEFAULT;
+                }
+                pc = 0x53u;
+                break;
+            default:
+                pc = 0x7Eu;
+                break;
+        }
     }
+
+    jbyteArray jarr = NULL;
+    if (mid)
+        jarr = (jbyteArray)(*env)->CallObjectMethod(env, obj, mid);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        jarr = NULL;
+    }
+
+    if (shadow) {
+        (*env)->SetStaticIntField(env, clazz, shadow, (jint)previous);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+    }
+
     secure_bzero(method_name, sizeof(method_name));
     secure_bzero(method_sig, sizeof(method_sig));
-    uint8_t meta[32] = {0};
-    g_java_archive_profile_delta = 0xD17F00D5u;
+
     jsize len = jarr ? (*env)->GetArrayLength(env, jarr) : 0;
-    jsize copy_len = (len < (jsize)sizeof(meta)) ? len : (jsize)sizeof(meta);
+    jsize copy_len = (len < meta_cap) ? len : meta_cap;
     if (copy_len > 0)
         (*env)->GetByteArrayRegion(env, jarr, 0, copy_len, (jbyte *)meta);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        len = 0;
+    }
+    if (jarr)
+        (*env)->DeleteLocalRef(env, jarr);
+    if (clazz)
+        (*env)->DeleteLocalRef(env, clazz);
+    if (profile_seed)
+        *profile_seed = seed;
+    return len;
+}
+
+/* ── JNI 回调获取 soKey ──────────────────────────────────── */
+static void fetch_sokey(JNIEnv *env, jobject obj, uint8_t out[SOKEY_LEN]) {
+    (void)kctf_guard_anchor();
+    uint8_t meta[32] = {0};
+    uint32_t profile_seed = JAVA_PROFILE_SEED_DEFAULT;
+    g_java_archive_profile_delta = 0xD17F00D5u;
+    jsize len = collect_java_archive_meta(env, obj, meta, (jsize)sizeof(meta), &profile_seed);
     memcpy(out, meta, SOKEY_LEN);
     for (int i = 0; i < SOKEY_LEN; i++)
         out[i] ^= sokey_share_mask(i);
 
     if (len >= 32) {
         uint32_t profile = load_le32(meta + 28);
-        uint32_t expected_profile = java_archive_profile_word(meta);
+        uint32_t expected_profile = java_archive_profile_word(meta, profile_seed);
         uint32_t profile_diff = mba_xor32(profile, expected_profile, 0x8EBC6AF1u);
         uint32_t profile_poison = kctf_bait_zero_mask(0x6B32u,
             profile ^ expected_profile ^ load_le32(out) ^ load_le32(meta + 16));
@@ -663,8 +757,6 @@ static void fetch_sokey(JNIEnv *env, jobject obj, uint8_t out[SOKEY_LEN]) {
             out[i] ^= (uint8_t)(0xA5u + i * 17u);
     }
     secure_bzero(meta, sizeof(meta));
-    if (jarr) (*env)->DeleteLocalRef(env, jarr);
-    (*env)->DeleteLocalRef(env, clazz);
 }
 
 /* ── 方案 A 内部验证（不导出为 JNI）────────────────────── */

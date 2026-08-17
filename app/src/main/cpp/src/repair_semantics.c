@@ -14,8 +14,8 @@ static const uint32_t KIN[8]  = {
 };
 /* volatile 强制编译器从 .rodata 生成 LDR（XOR 加密存储，converge.py 填入） */
 static volatile const uint32_t KOUT_ENC[8] = {
-    0x82afa7c8u, 0x8a0b659fu, 0x261758a3u, 0xee834560u,
-    0x151f01d2u, 0x98a3f80cu, 0xe8e0f6b3u, 0xe53e36dau
+    0x992e6fc8u, 0xa68ddd9fu, 0xca9910a3u, 0x85011d60u,
+    0x719d49d2u, 0x742da00bu, 0xcc673eb3u, 0x81a07edau
 };
 
 static inline uint32_t s3_check(uint32_t val, uint32_t param) {
