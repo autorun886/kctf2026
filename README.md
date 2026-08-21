@@ -1,59 +1,82 @@
-# KCTF2026 出题说明
+# 看雪 KCTF 2026 第六题：酉时·书院迷局
 
-## 出题思路
+本仓库是看雪 KCTF 2026 第六题「酉时·书院迷局」的完整工程，包含 Android/Native 源码、可复现构建工具、最终发布 APK、公开求解辅助脚本及题解文档。
 
-题目的核心是“真实但不可组合”。每个检查点都是真实参与最终验证的逻辑，选手不能靠删分支、改返回值或 hook 某个单点拿到 flag；但这些真实信息又被拆成几类互相依赖的约束，不能直接组合成一个短路径。
+题目类型为 Android Native 逆向。选手提交 100 个小写十六进制字符，应用解码为 50 字节，并在 JNI 中将奇偶位拆成两条相互约束的 25 字节路径。核心考点包括 APK/ELF 完整性派生、受限控制流语义、ARX key material、动态 S-Box 与双 IV SPN，以及运行时检测对真实数据流的污染。
 
-输入是 100 个 hex 字符，解码为 50 字节后按奇偶位拆成两条 25 字节路径：
+## 仓库结构
 
-- `flagA` 负责修复/验证控制流、S-Box、常量和语义参数。
-- `flagB` 负责驱动 ARX key schedule 和双 IV SPN 验证。
-- `soKey` 从 APK 内 `libkctf.so` 的稳定 guard 代码段 CRC32 派生，并参与两条路径的目标状态加密。
-
-设计目标不是堆反调试，而是让选手必须先理解数据流，再把静态恢复的信息、运行时完整性信息、约束求解结果拼起来。反 trace/hook/unicorn 只用于抬高直接动态提取中间值的成本，避免一条 hook 链绕开主逻辑。
-
-## 题目特色
-
-- 双路径交错输入：50 字节 flag 被拆成 `flagA[25]` 和 `flagB[25]`，单看 JNI 参数不会直接看到结构。
-- `soKey` 绑定 APK：Java 从 APK 读取 `libkctf.so`，定位 `.kctfguard` 或 `.text` 中的 guard bytes，CRC32 后 LCG 扩展为 16 字节；native 再校验已加载 guard 的 CRC，patch `.text` 或换包会污染结果。
-- 方案 A 是显式修复链：`repair_cfg -> repair_sbox -> repair_constants -> repair_semantics -> core_compute`，前一步结果会成为后一步输入。
-- 方案 B 是隐式约束链：25 字节输入经 12 轮 ARX 扩展为 material，再派生 round keys、configs、sbox seeds 和 delta，最后跑两个不同 IV 的 16 轮 SPN。
-- Oracle 只暴露 `material[80:96] + material[0:8] + tag[8]`，不再暴露 `material[8:16]`，阻断旧版直接 ARX 逆推捷径。
-- 反动态分析点都接入真实计算：TracerPid、maps 扫描、HWCAP、inline hook、时序采样等检测结果会污染 round key、delta 或 oracle 解密，而不是只做退出。
-- 蜜罐常量和函数名故意像 AES/TEA/ChaCha/SM4/SHA，但正确路径必须以 xref 和数据流为准。
-
-## 选手视角题解
-
-1. 定位入口：`MainActivity` 将输入 hex 解码为 50 字节，调用 `nativeProcessInput(byte[])`。JNI 中按奇偶位拆分为 `flagA` 和 `flagB`。
-2. 恢复 `soKey`：逆向 Java 侧短名 metadata helper 和 native 侧反射 token 解码，从 APK 提取 `lib/arm64-v8a/libkctf.so`，解析 ELF section，计算 guard bytes 的 CRC32，再按 LCG 逻辑得到 16 字节 `soKey`。
-3. 解方案 A：从 `repair_cfg.c` 和 `core_compute` 反推出 BB 偏移，恢复 `flagA[0:13]`；再跟进 `repair_sbox`、`repair_constants`、`repair_semantics`，得到 XTEA delta、LCG seed、step2/step3 参数。最终 `core_compute` 的输出要等于 `ENC_EXPECTED_STATE_A ^ soKey`。
-4. 解方案 B：实现 `expand_key_material` 的 ARX 逻辑，恢复 `key_schedule` 对 round keys、configs、seeds、delta 的派生；实现 S-Box 生成和 SPN 16 轮正向模拟。
-5. 建模求解：以 `flagB[25]` 为 200 bit 变量，加入 IV1 和 IV2 两组最终状态约束。Oracle 给出的 seeds 和 `material[0:8]` 可作为早期约束，但不能直接补齐 ARX 末态。
-6. 组合 flag：将 `flagA` 和 `flagB` 逐字节交错，输出 50 字节 hex。
-
-当前验证值：
-
-- `guard_crc32 = 3e0695ce`
-- `soKey = 870573e5f5c63d52862dbd05ab3d9494`
-- `flagA = a77a78ffc894367d1bf5bb3faab6e2f4db0070533de8b73443`
-- `flagA_decoded = 0200000001832dbd05c70573e5b979379edec0adde07421337`
-- `flagB = 7ae31b94d256f80c41b7298e63a5df104bc8723d960fe458ad`
-- `flag = a77a7ae3781bff94c8d2945636f87d0c1b41f5b7bb293f8eaa63b6a5e2dff410db4b00c87072533d3d96e80fb7e4345843ad`
-
-## Flag Generate 脚本
-
-脚本位置：`flag_generate.py`
-
-运行：
-
-```bash
-python3 flag_generate.py
+```text
+.
+├── app/                         Android 应用与 Native 题目源码
+├── gradle/                      Gradle Wrapper 配置
+├── KCTF2026_release_current/    当前发布包、公开 WP 与求解辅助脚本
+├── BUILD.md                     编译、收敛和一致性验证说明
+├── converge.py                  Native 常量收敛与 APK 后处理脚本
+├── extract_bb_addrs.py          Native 基本块地址提取工具
+├── flag_generate.py             构建后 flag 派生验证脚本
+└── verify.py                    Python 侧方案 A/B 验证脚本
 ```
 
-也可以指定 APK：
+## 当前发布包
 
-```bash
-python3 flag_generate.py app/build/outputs/apk/release/app-release.apk
+最终题目位于 [`KCTF2026_release_current/`](KCTF2026_release_current/README.md)：
+
+```text
+SHA256(KCTF2026.apk) = 21f932aa6222a37ffc4183861017794c45c3e07a5eb88a7b9050e044256e763f
+ABI                     arm64-v8a
+minSdk                  29
+targetSdk               36
 ```
 
-脚本会从 APK 中读取 `libkctf.so` 派生 `soKey`，根据逆向恢复的 BB 偏移生成 `flagA`，再与求解得到的 `flagB` 交错输出最终 flag。
+校验发布目录：
+
+```bash
+cd KCTF2026_release_current
+sha256sum -c SHA256SUMS.txt
+```
+
+该 APK 已在真实 arm64 Android 设备上安装验证，正确输入会显示 `Correct! Flag accepted.`。
+
+## 编译
+
+普通 Gradle 构建：
+
+```bash
+./gradlew assembleRelease
+```
+
+本题的正式发布包还包含 Native 常量收敛、oracle patch、strip、zipalign 与重新签名流程。生成可发布 APK 应运行：
+
+```bash
+python3 converge.py --release --max-iter 10
+```
+
+完整环境要求、处理步骤及字节一致性校验见 [`BUILD.md`](BUILD.md)。
+
+签名私钥和口令不在仓库中。普通构建可以生成未签名 release APK；需要安装或制作发布包时，请按 `BUILD.md` 配置自己的 keystore 和 `KCTF_*` 环境变量。
+
+## 求解资料
+
+发布目录内提供以下资料：
+
+- [`DESIGN.md`](KCTF2026_release_current/DESIGN.md)：题目设计、混淆层与可解性边界。
+- [`WRITEUP.md`](KCTF2026_release_current/WRITEUP.md)：选手视角的完整恢复路线，包含最终答案，阅读前请注意剧透。
+- [`flag-keygen.py`](KCTF2026_release_current/flag-keygen.py)：保留的 Bitwuzla/QF_BV 建模脚本，用于求解隐藏的 `material[8:16]` 通道。
+
+快速检查公开约束，不启动 SMT 求解：
+
+```bash
+python3 KCTF2026_release_current/flag-keygen.py --self-test
+```
+
+运行完整隐藏通道模型：
+
+```bash
+python3 -m pip install bitwuzla
+python3 KCTF2026_release_current/flag-keygen.py \
+  --timeout-ms 600000 --verbose \
+  KCTF2026_release_current/KCTF2026.apk
+```
+
+脚本只读取发布 APK、派生 `soKey` 并求解 material 通道，不修改 APK，也不会打印最终 flag。

@@ -2305,22 +2305,44 @@ def main():
 
     # Re-sign APK (zip modification invalidates existing signature)
     apksigner = find_build_tool("apksigner")
+    sign_env = os.environ.copy()
     if BUILD_TYPE == "release":
-        ks = os.path.join(ROOT, "kctf2026.jks")
+        ks = os.path.expanduser(os.environ.get("KCTF_KEYSTORE", ""))
+        store_pass = os.environ.get("KCTF_STORE_PASSWORD")
+        key_alias = os.environ.get("KCTF_KEY_ALIAS", "kctf")
+        key_pass = os.environ.get("KCTF_KEY_PASSWORD") or store_pass
+        if not ks or not store_pass:
+            raise RuntimeError(
+                "release signing requires KCTF_KEYSTORE and KCTF_STORE_PASSWORD; "
+                "KCTF_KEY_ALIAS and KCTF_KEY_PASSWORD are optional"
+            )
+        sign_env["KCTF_KEY_PASSWORD"] = key_pass
         sign_args = [apksigner, "sign", "--v1-signing-enabled", "false",
                      "--v2-signing-enabled", "false", "--v3-signing-enabled", "true",
-                     "--ks", ks, "--ks-pass", "pass:kctf2026",
-                     "--ks-key-alias", "kctf", "--key-pass", "pass:kctf2026", apk_path]
+                     "--ks", ks, "--ks-pass", "env:KCTF_STORE_PASSWORD",
+                     "--ks-key-alias", key_alias,
+                     "--key-pass", "env:KCTF_KEY_PASSWORD", apk_path]
     else:
         ks = os.path.expanduser("~/.android/debug.keystore")
-        sign_args = [apksigner, "sign", "--ks", ks, "--ks-pass", "pass:android",
-                     "--ks-key-alias", "androiddebugkey", "--key-pass", "pass:android", apk_path]
+        sign_env["ANDROID_DEBUG_STORE_PASSWORD"] = os.environ.get(
+            "ANDROID_DEBUG_STORE_PASSWORD", "android"
+        )
+        sign_env["ANDROID_DEBUG_KEY_PASSWORD"] = os.environ.get(
+            "ANDROID_DEBUG_KEY_PASSWORD", "android"
+        )
+        sign_args = [apksigner, "sign", "--ks", ks,
+                     "--ks-pass", "env:ANDROID_DEBUG_STORE_PASSWORD",
+                     "--ks-key-alias", "androiddebugkey",
+                     "--key-pass", "env:ANDROID_DEBUG_KEY_PASSWORD", apk_path]
 
-    if apksigner and os.path.exists(ks):
-        subprocess.run(sign_args, check=True, capture_output=True)
+    if apksigner and os.path.isfile(ks):
+        subprocess.run(sign_args, check=True, capture_output=True, env=sign_env)
         log(f"APK signed: {apk_path}")
+    elif BUILD_TYPE == "release":
+        missing = "apksigner" if not apksigner else f"keystore: {ks}"
+        raise RuntimeError(f"release signing dependency not found: {missing}")
     else:
-        log(f"WARNING: apksigner not found, APK unsigned!")
+        log("WARNING: debug signing dependency not found, APK unsigned!")
 
     log(f"APK patched: {apk_path} (oracle data injected)")
 

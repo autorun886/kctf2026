@@ -2,8 +2,18 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+val releaseKeystorePath = providers.environmentVariable("KCTF_KEYSTORE").orNull
+val releaseStorePassword = providers.environmentVariable("KCTF_STORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("KCTF_KEY_ALIAS").orNull ?: "kctf"
+val releaseKeyPassword = providers.environmentVariable("KCTF_KEY_PASSWORD").orNull
+    ?: releaseStorePassword
+val releaseSigningConfigured =
+    !releaseKeystorePath.isNullOrBlank() && !releaseStorePassword.isNullOrBlank()
+
 android {
     namespace = "com.autorun.kctf"
+    buildToolsVersion = "36.0.0"
+    ndkVersion = "27.0.12077973"
     compileSdk {
         version = release(36)
     }
@@ -15,18 +25,19 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += "arm64-v8a"
         }
     }
 
     signingConfigs {
-        create("release") {
-            storeFile = file("../kctf2026.jks")
-            storePassword = "kctf2026"
-            keyAlias = "kctf"
-            keyPassword = "kctf2026"
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
     buildTypes {
@@ -44,7 +55,9 @@ android {
             isJniDebuggable = false
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -75,7 +88,4 @@ dependencies {
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.constraintlayout)
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.ext.junit)
-    androidTestImplementation(libs.espresso.core)
 }

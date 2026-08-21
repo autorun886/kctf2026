@@ -1,27 +1,55 @@
 # KCTF2026 编译文档
 
-本文记录如何从当前源码生成与 `KCTF2026_release_current/KCTF2026.apk` 一致的 release APK。
+本文记录如何从当前源码生成与仓库内 `KCTF2026_release_current/KCTF2026.apk` 一致的 release APK。
 
 ## 环境
 
-本机验证环境：
+已验证的工具版本：
 
-- JDK: `/home/user/.local/jdk-debroot/usr/lib/jvm/java-17-openjdk-amd64`
-- Android SDK: `/home/user/Android/Sdk`
-- Android platform: `android-36`
-- NDK: `/home/user/Android/Sdk/ndk/27.0.12077973`
-- CMake: `/home/user/Android/Sdk/cmake/3.22.1`
-- Gradle wrapper: `gradle-8.13`
-- Android Gradle Plugin: `8.13.0`
+- JDK 17（源码兼容级别为 Java 11，AGP 运行时需要 JDK 17）
+- Python 3.10 或更高版本
+- Android SDK Platform 36
+- Android SDK Build Tools 36.0.0
+- Android NDK 27.0.12077973
+- CMake 3.22.1
+- Gradle 8.13（由 Wrapper 自动下载）
+- Android Gradle Plugin 8.13.0
+
+完整求解另需 Bitwuzla Python 绑定；编译和发布包自检不需要它。Linux/macOS 还建议安装 `unzip`、`diff`、`sha256sum` 和 `readelf`，用于执行文档中的一致性检查。
 
 建议先设置环境变量：
 
 ```bash
-export JAVA_HOME=/home/user/.local/jdk-debroot/usr/lib/jvm/java-17-openjdk-amd64
-export ANDROID_HOME=/home/user/Android/Sdk
-export ANDROID_SDK_ROOT=/home/user/Android/Sdk
+export JAVA_HOME=/path/to/jdk-17
+export ANDROID_SDK_ROOT=/path/to/android-sdk
+export ANDROID_HOME="$ANDROID_SDK_ROOT"
 export PATH="$JAVA_HOME/bin:$PATH"
 ```
+
+可通过 Android SDK Command-line Tools 安装固定版本组件：
+
+```bash
+sdkmanager \
+  "platforms;android-36" \
+  "build-tools;36.0.0" \
+  "ndk;27.0.12077973" \
+  "cmake;3.22.1"
+```
+
+## 签名配置
+
+签名私钥和口令不进入仓库。普通 `assembleRelease` 在未配置凭据时会生成未签名 APK；`converge.py --release` 要求以下环境变量：
+
+```bash
+export KCTF_KEYSTORE=/absolute/path/to/release.jks
+export KCTF_KEY_ALIAS=kctf
+read -rsp "Keystore password: " KCTF_STORE_PASSWORD
+export KCTF_STORE_PASSWORD
+read -rsp "Key password: " KCTF_KEY_PASSWORD
+export KCTF_KEY_PASSWORD
+```
+
+`KCTF_KEY_PASSWORD` 未设置时默认复用 `KCTF_STORE_PASSWORD`。请使用题目专用 keystore，不要复用真实产品签名密钥。若只需功能验证，可以自行生成测试 keystore；要得到与当前发布 APK 字节完全一致的文件，则必须使用该 APK 原始的题目专用签名密钥。
 
 ## 普通构建
 
@@ -31,13 +59,13 @@ export PATH="$JAVA_HOME/bin:$PATH"
 ./gradlew assembleRelease
 ```
 
-输出文件：
+未配置签名凭据时输出：
 
 ```text
-app/build/outputs/apk/release/app-release.apk
+app/build/outputs/apk/release/app-release-unsigned.apk
 ```
 
-注意：普通 Gradle 构建可以成功，但不会与发布包字节级一致。原因是本题 native 层包含构建后收敛常量和 oracle shellcode 后处理，发布 APK 不是单次 `assembleRelease` 的直接输出。
+配置 `KCTF_*` 签名变量后，Gradle 输出 `app-release.apk`。普通 Gradle 构建可以成功，但不会与发布包字节级一致。原因是本题 native 层包含构建后收敛常量和 oracle shellcode 后处理，发布 APK 不是单次 `assembleRelease` 的直接输出。
 
 ## 收敛构建
 
@@ -59,7 +87,7 @@ python3 converge.py --release --max-iter 10
 8. 替换 APK 内的 `lib/arm64-v8a/libkctf.so`
 9. 清理 AGP VCS metadata、AGP app metadata 和 `DebugProbesKt.bin`
 10. 重新 zipalign
-11. 使用 `kctf2026.jks` 重新签名 APK
+11. 使用环境变量指定的外部 keystore 重新签名 APK
 12. 运行 Python 侧方案 A/B 验证
 
 本次收敛结果：
@@ -78,13 +106,13 @@ flag        = a77a7ae3781bff94c8d2945636f87d0c1b41f5b7bb293f8eaa63b6a5e2dff410db
 收敛后的 `.so` 逻辑内容已经一致，但 LLVM linker 生成的 `.note.gnu.build-id` 可能不同。发布包的 build-id 为：
 
 ```text
-d8b94a5f528806996fee71c4785bf20c86f53deb
+fd17b630105043c711b8d4082c964c5a15fe21aa
 ```
 
 如果要得到与 `KCTF2026_release_current/KCTF2026.apk` 字节完全一致的 APK，需要把 APK 内 `libkctf.so` 的 build-id 归一化为该值，清理发布 metadata，重新 zipalign，然后重新签名：
 
 ```bash
-python3 -c 'import zipfile, os; apk="app/build/outputs/apk/release/app-release.apk"; out=apk+".tmp"; name="lib/arm64-v8a/libkctf.so"; skip={"META-INF/version-control-info.textproto","META-INF/com/android/build/gradle/app-metadata.properties","DebugProbesKt.bin"}; release=bytes.fromhex("d8b94a5f528806996fee71c4785bf20c86f53deb"); off=0x2e0; zin=zipfile.ZipFile(apk,"r"); zout=zipfile.ZipFile(out,"w");
+python3 -c 'import zipfile, os; apk="app/build/outputs/apk/release/app-release.apk"; out=apk+".tmp"; name="lib/arm64-v8a/libkctf.so"; skip={"META-INF/version-control-info.textproto","META-INF/com/android/build/gradle/app-metadata.properties","DebugProbesKt.bin"}; release=bytes.fromhex("fd17b630105043c711b8d4082c964c5a15fe21aa"); off=0x2e0; zin=zipfile.ZipFile(apk,"r"); zout=zipfile.ZipFile(out,"w");
 for item in zin.infolist():
     if item.filename in skip: continue
     data=zin.read(item.filename)
@@ -93,20 +121,22 @@ for item in zin.infolist():
     zout.writestr(item,data)
 zin.close(); zout.close(); os.replace(out,apk)'
 
-/home/user/Android/Sdk/build-tools/36.0.0/zipalign -p -f 4 \
+BUILD_TOOLS_DIR="${ANDROID_BUILD_TOOLS:-$ANDROID_SDK_ROOT/build-tools/36.0.0}"
+
+"$BUILD_TOOLS_DIR/zipalign" -p -f 4 \
   app/build/outputs/apk/release/app-release.apk \
   app/build/outputs/apk/release/app-release.aligned.apk
 mv app/build/outputs/apk/release/app-release.aligned.apk \
   app/build/outputs/apk/release/app-release.apk
 
-/home/user/Android/Sdk/build-tools/36.0.0/apksigner sign \
+"$BUILD_TOOLS_DIR/apksigner" sign \
   --v1-signing-enabled false \
   --v2-signing-enabled false \
   --v3-signing-enabled true \
-  --ks kctf2026.jks \
-  --ks-pass pass:kctf2026 \
-  --ks-key-alias kctf \
-  --key-pass pass:kctf2026 \
+  --ks "$KCTF_KEYSTORE" \
+  --ks-pass env:KCTF_STORE_PASSWORD \
+  --ks-key-alias "$KCTF_KEY_ALIAS" \
+  --key-pass env:KCTF_KEY_PASSWORD \
   app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -117,14 +147,14 @@ mv app/build/outputs/apk/release/app-release.aligned.apk \
 比较 APK 哈希：
 
 ```bash
-sha256sum app/build/outputs/apk/release/app-release.apk ../KCTF2026_release_current/KCTF2026.apk
+sha256sum app/build/outputs/apk/release/app-release.apk KCTF2026_release_current/KCTF2026.apk
 ```
 
-期望输出：
+使用原始题目签名密钥时，期望输出：
 
 ```text
-e891d19b725b470dc5cf55531d6f3b3b977f5937b37f600d322365cdb155c05a  app/build/outputs/apk/release/app-release.apk
-e891d19b725b470dc5cf55531d6f3b3b977f5937b37f600d322365cdb155c05a  ../KCTF2026_release_current/KCTF2026.apk
+21f932aa6222a37ffc4183861017794c45c3e07a5eb88a7b9050e044256e763f  app/build/outputs/apk/release/app-release.apk
+21f932aa6222a37ffc4183861017794c45c3e07a5eb88a7b9050e044256e763f  KCTF2026_release_current/KCTF2026.apk
 ```
 
 验证 flag 派生：
@@ -138,7 +168,7 @@ python3 flag_generate.py app/build/outputs/apk/release/app-release.apk
 ```bash
 mkdir -p /tmp/kctf-built /tmp/kctf-release
 unzip -q -o app/build/outputs/apk/release/app-release.apk -d /tmp/kctf-built
-unzip -q -o ../KCTF2026_release_current/KCTF2026.apk -d /tmp/kctf-release
+unzip -q -o KCTF2026_release_current/KCTF2026.apk -d /tmp/kctf-release
 diff -qr /tmp/kctf-built /tmp/kctf-release
 ```
 

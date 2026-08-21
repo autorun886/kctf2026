@@ -1,15 +1,34 @@
+# Android Studio / IntelliJ
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.idea/
+
+# Gradle / Android build output
+.gradle/
+build/
+**/build/
+.cxx/
+**/.cxx/
+.externalNativeBuild/
+captures/
 local.properties
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local analysis and temporary artifacts
+/*.apk
+/*.zip
+/*.png
+/*.bin
+/*.log
+
+# Signing credentials
+*.jks
+*.keystore
+*.p12
+keystore.properties
+.env
+
+# OS files
+.DS_Store

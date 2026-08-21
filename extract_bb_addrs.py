@@ -3,10 +3,47 @@
 extract_bb_addrs.py — 从 libkctf.so 自动提取 core_compute 的 BB 关键地址。
 输出可直接粘贴到 repair_cfg.c 的 #define 区域。
 """
-import struct, sys, re
+import glob
+import os
+import shutil
+import struct
+import subprocess
+import sys
 
-SO_PATH = sys.argv[1] if len(sys.argv) > 1 else \
-    "app/build/intermediates/cxx/Debug/162k275h/obj/arm64-v8a/libkctf.so"
+def find_default_so():
+    candidates = glob.glob(
+        "app/build/intermediates/cxx/*/*/obj/arm64-v8a/libkctf.so"
+    )
+    if not candidates:
+        raise SystemExit("未找到 libkctf.so；请先构建项目或将路径作为第一个参数传入")
+    return max(candidates, key=os.path.getmtime)
+
+
+def find_llvm_nm():
+    configured = os.environ.get("LLVM_NM")
+    if configured:
+        return configured
+
+    ndk_roots = [
+        os.environ.get("ANDROID_NDK_HOME"),
+        os.environ.get("ANDROID_NDK_ROOT"),
+    ]
+    for sdk_var in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        sdk_root = os.environ.get(sdk_var)
+        if sdk_root:
+            ndk_roots.extend(glob.glob(os.path.join(sdk_root, "ndk", "*")))
+
+    for ndk_root in filter(None, ndk_roots):
+        matches = glob.glob(
+            os.path.join(ndk_root, "toolchains", "llvm", "prebuilt", "*", "bin", "llvm-nm*")
+        )
+        if matches:
+            return matches[0]
+
+    return shutil.which("llvm-nm") or shutil.which("llvm-nm.exe")
+
+
+SO_PATH = sys.argv[1] if len(sys.argv) > 1 else find_default_so()
 
 with open(SO_PATH, "rb") as f:
     data = f.read()
@@ -36,10 +73,9 @@ def read_u32_va(va):
     return struct.unpack_from('<I', data, vaddr_to_foff(va))[0]
 
 # 找 core_compute 符号地址
-nm_path = SO_PATH.replace("libkctf.so", "")
-import subprocess, os
-NDK = os.path.expanduser("~/AppData/Local/Android/Sdk/ndk/27.0.12077973")
-NM  = f"{NDK}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm.exe"
+NM = find_llvm_nm()
+if not NM:
+    raise SystemExit("未找到 llvm-nm；请设置 ANDROID_SDK_ROOT、ANDROID_NDK_HOME 或 LLVM_NM")
 out = subprocess.check_output([NM, "--defined-only", SO_PATH], text=True)
 syms = {}
 for line in out.splitlines():
